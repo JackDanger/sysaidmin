@@ -1,0 +1,23 @@
+FROM debian:12-slim
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl build-essential pkg-config libssl-dev git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable && \
+    cargo install cargo-deb
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml Justfile LICENSE.md ./
+COPY sysaidmin ./sysaidmin
+
+RUN cargo build --workspace --locked --release
+RUN cargo deb -p sysaidmin --no-build
+
+ENTRYPOINT ["/bin/bash"]
+
