@@ -1,12 +1,13 @@
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use log::{debug, info, trace};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -22,75 +23,135 @@ use crate::task::{Task, TaskDetail, TaskStatus};
 const TICK_RATE: Duration = Duration::from_millis(200);
 
 pub fn run(app: &mut App) -> Result<()> {
-    enable_raw_mode()?;
+    info!("Initializing TUI");
+    trace!("Enabling raw mode");
+    enable_raw_mode()
+        .context("Failed to enable raw mode")?;
+    
+    trace!("Entering alternate screen");
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen)
+        .context("Failed to enter alternate screen")?;
+    
+    trace!("Creating terminal backend");
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend)
+        .context("Failed to create terminal")?;
+    info!("Terminal initialized successfully");
 
+    trace!("Starting main event loop");
     let res = run_loop(&mut terminal, app);
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    
+    trace!("Cleaning up TUI");
+    disable_raw_mode()
+        .context("Failed to disable raw mode")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("Failed to leave alternate screen")?;
+    terminal.show_cursor()
+        .context("Failed to show cursor")?;
+    info!("TUI cleanup completed");
+    
     res
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    info!("Event loop started");
     let mut last_tick = Instant::now();
+    let mut iteration_count = 0u64;
+    
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
+        iteration_count += 1;
+        // Only log iterations to file, not stderr (trace level)
+        log::trace!("Event loop iteration {}", iteration_count);
+        
+        log::trace!("Drawing frame");
+        terminal.draw(|frame| draw(frame, app))
+            .context("Failed to draw frame")?;
 
         let timeout = TICK_RATE
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::from_secs(0));
 
-        if event::poll(timeout)? {
-            match event::read()? {
+        log::trace!("Polling for events (timeout: {:?})", timeout);
+        if event::poll(timeout)
+            .context("Failed to poll for events")? {
+            log::trace!("Event available, reading");
+            match event::read()
+                .context("Failed to read event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    debug!("Key pressed: {:?}", key.code);
                     if app.has_pending_approval() {
+                        info!("Handling approval key");
                         match key.code {
                             KeyCode::Char('y') => {
+                                info!("User approved blocked task");
                                 app.approve_current_blocked();
                                 continue;
                             }
                             KeyCode::Char('n') => {
+                                info!("User rejected blocked task");
                                 app.reject_current_blocked();
                                 continue;
                             }
-                            _ => {}
+                            _ => {
+                                log::debug!("Ignoring key during approval: {:?}", key.code);
+                            }
                         }
                     }
                     let editing = matches!(app.input_mode, InputMode::Prompt);
                     match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') if !editing => app.move_next(),
-                        KeyCode::Up | KeyCode::Char('k') if !editing => app.move_prev(),
+                        KeyCode::Char('q') => {
+                            info!("Quit key pressed, exiting event loop");
+                            return Ok(());
+                        }
+                        KeyCode::Down | KeyCode::Char('j') if !editing => {
+                            log::trace!("Moving selection down");
+                            app.move_next();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if !editing => {
+                            log::trace!("Moving selection up");
+                            app.move_prev();
+                        }
                         KeyCode::Tab => {
+                            info!("Toggling input mode");
                             app.input_mode = match app.input_mode {
                                 InputMode::Prompt => InputMode::Logs,
                                 InputMode::Logs => InputMode::Prompt,
-                            }
+                            };
                         }
                         KeyCode::Enter if editing => {
+                            info!("Submitting prompt");
                             app.submit_prompt();
                         }
                         KeyCode::Backspace if editing => {
+                            log::trace!("Backspace pressed");
                             app.input.pop();
                         }
                         KeyCode::Char(c) if editing => {
+                            log::trace!("Character entered: {:?}", c);
                             app.input.push(c);
                         }
-                        _ => {}
+                        _ => {
+                            log::trace!("Unhandled key: {:?}", key.code);
+                        }
                     }
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
+                Event::Resize(width, height) => {
+                    debug!("Terminal resized: {}x{}", width, height);
+                }
+                other => {
+                    log::trace!("Other event: {:?}", other);
+                }
             }
         }
 
         if last_tick.elapsed() >= TICK_RATE {
             last_tick = Instant::now();
+        }
+        
+        // Log every 1000 iterations to track if we're stuck (debug level, goes to file only)
+        if iteration_count % 1000 == 0 {
+            log::debug!("Event loop still running (iteration {})", iteration_count);
         }
     }
 }

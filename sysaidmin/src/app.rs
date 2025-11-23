@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use log::{debug, error, info, trace, warn};
+
 use crate::allowlist::Allowlist;
 use crate::api::AnthropicClient;
 use crate::config::AppConfig;
@@ -37,6 +39,8 @@ impl App {
         executor: Executor,
         session: SessionStore,
     ) -> Self {
+        info!("Creating new App instance");
+        debug!("App config: dry_run={}, offline_mode={}", config.dry_run, config.offline_mode);
         Self {
             tasks: Vec::new(),
             selected: 0,
@@ -56,34 +60,60 @@ impl App {
     pub fn submit_prompt(&mut self) {
         let prompt = self.input.trim().to_string();
         if prompt.is_empty() {
+            warn!("Attempted to submit empty prompt");
             return;
         }
+        info!("Submitting prompt: {}", prompt);
         self.log(format!("Requesting plan for: {}", prompt));
+        
+        trace!("Calling API client.plan()");
         match self.client.plan(&prompt) {
             Ok(response_text) => {
+                info!("Received plan response ({} bytes)", response_text.len());
+                trace!("Response preview: {}", response_text.chars().take(200).collect::<String>());
+                
+                trace!("Parsing plan JSON");
                 match parser::parse_plan(&response_text, &self.config.default_shell) {
                     Ok(parsed) => {
-                        self.summary = parsed.summary;
+                        info!("Plan parsed successfully: {} tasks", parsed.tasks.len());
+                        self.summary = parsed.summary.clone();
                         self.tasks = parsed.tasks;
                         self.input.clear();
                         self.selected = 0;
-                        for task in &mut self.tasks {
+                        
+                        info!("Evaluating {} tasks against allowlist", self.tasks.len());
+                        for (idx, task) in self.tasks.iter_mut().enumerate() {
+                            trace!("Evaluating task {}: {}", idx, task.description);
                             match self.allowlist.evaluate(task) {
-                                Ok(status) => task.status = status,
-                                Err(err) => task.status = TaskStatus::Blocked(err.to_string()),
+                                Ok(status) => {
+                                    debug!("Task {} status: {:?}", idx, status);
+                                    task.status = status;
+                                }
+                                Err(err) => {
+                                    warn!("Task {} blocked: {}", idx, err);
+                                    task.status = TaskStatus::Blocked(err.to_string());
+                                }
                             }
                         }
+                        
+                        trace!("Persisting plan");
                         self.persist_plan();
+                        
+                        trace!("Enqueueing blocked tasks");
                         self.enqueue_blocked();
+                        
                         self.log("Plan updated from SYSAIDMIN.");
+                        info!("Running ready tasks");
                         self.run_ready_tasks();
                     }
                     Err(err) => {
+                        error!("Failed parsing plan: {:?}", err);
                         self.log(format!("Failed parsing plan: {err:?}"));
                     }
                 }
             }
             Err(err) => {
+                error!("Failed requesting plan: {:?}", err);
                 self.log(format!("Failed requesting plan: {err:?}"));
             }
         }
@@ -116,21 +146,30 @@ impl App {
     }
 
     pub fn execute_selected(&mut self) {
+        info!("Executing selected task (index: {})", self.selected);
         let (detail, description) = {
             let Some(task) = self.tasks.get_mut(self.selected) else {
+                warn!("No task at selected index {}", self.selected);
                 return;
             };
+            let desc = task.description.clone();
             if !matches!(task.status, TaskStatus::Ready | TaskStatus::Proposed) {
+                warn!("Task {} not ready for execution (status: {:?})", self.selected, task.status);
                 return;
             }
+            info!("Executing task: {}", desc);
             task.status = TaskStatus::Running;
-            (task.detail.clone(), task.description.clone())
+            (task.detail.clone(), desc)
         };
 
         match detail {
             TaskDetail::Command(cmd) => {
+                info!("Running command: {} (shell: {})", cmd.command, cmd.shell);
+                trace!("Command details: cwd={:?}, requires_root={}", cmd.cwd, cmd.requires_root);
                 match self.executor.run_command(&cmd) {
                     Ok(result) => {
+                        info!("Command executed successfully: exit_code={}, stdout_len={}, stderr_len={}", 
+                              result.status, result.stdout.len(), result.stderr.len());
                         self.mark_complete_with_log(
                             format!("Executed '{}' exit {}", description, result.status),
                             Some(result),
@@ -138,6 +177,7 @@ impl App {
                         );
                     }
                     Err(err) => {
+                        error!("Command execution failed: {:?}", err);
                         self.log(format!("Execution failed: {err:?}"));
                         self.set_blocked(format!("execution failed: {err}"));
                     }
@@ -145,8 +185,14 @@ impl App {
                 return;
             }
             TaskDetail::FileEdit(edit) => {
+                let path_str = edit.path.as_deref().unwrap_or("<no path>");
+                info!("Applying file edit: {} ({} bytes)", path_str, edit.new_text.len());
                 match self.executor.apply_file_edit(&edit) {
                     Ok(outcome) => {
+                        info!("File edit successful: {}", outcome.path.display());
+                        if let Some(ref backup) = outcome.backup_path {
+                            info!("Backup created: {}", backup.display());
+                        }
                         self.mark_complete_with_log(
                             format!(
                                 "Wrote {} (backup: {})",
@@ -162,6 +208,7 @@ impl App {
                         );
                     }
                     Err(err) => {
+                        error!("File edit failed: {:?}", err);
                         self.log(format!("Edit failed: {err:?}"));
                         self.set_blocked(format!("edit failed: {err}"));
                     }
@@ -169,6 +216,7 @@ impl App {
                 return;
             }
             TaskDetail::Note { details } => {
+                info!("Processing note task: {}", details);
                 self.log(format!("Note: {}", details));
                 if let Some(task) = self.tasks.get_mut(self.selected) {
                     task.status = TaskStatus::Complete;

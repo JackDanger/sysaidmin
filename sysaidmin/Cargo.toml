@@ -12,12 +12,14 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.27"
 dirs = "5.0"
+log = { version = "0.4", features = ["std"] }
 ratatui = { version = "0.27", default-features = false, features = ["crossterm"] }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_with = "3.9"
+signal-hook = "0.3"
 thiserror = "1.0"
 toml = "0.8"
 uuid = { version = "1.8", features = ["v4", "serde"] }
