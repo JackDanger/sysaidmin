@@ -1,11 +1,25 @@
 FROM debian:12-slim
 
+ARG RUST_TARGET="x86_64-unknown-linux-gnu"
+ARG DEB_ARCH="amd64"
+
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+    CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc \
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential pkg-config libssl-dev git && \
+    ca-certificates curl build-essential pkg-config libssl-dev git dpkg-dev \
+    gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+    gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-riscv64-linux-gnu \
+    libc6-dev-armhf-cross libc6-dev-riscv64-cross && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable && \
@@ -16,8 +30,12 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml Justfile LICENSE.md ./
 COPY sysaidmin ./sysaidmin
 
-RUN cargo build --workspace --locked --release
-RUN cargo deb -p sysaidmin --no-build
+RUN rustup target add ${RUST_TARGET}
+RUN cargo build --workspace --locked --release --target ${RUST_TARGET}
+RUN DEB_BUILD_ARCH=${DEB_ARCH} cargo deb -p sysaidmin --target ${RUST_TARGET} --no-build
+RUN mkdir -p /app/artifacts/${DEB_ARCH}/bin /app/artifacts/${DEB_ARCH}/deb && \
+    install -Dm755 target/${RUST_TARGET}/release/sysaidmin /app/artifacts/${DEB_ARCH}/bin/sysaidmin && \
+    cp target/${RUST_TARGET}/debian/*.deb /app/artifacts/${DEB_ARCH}/deb/
 
 ENTRYPOINT ["/bin/bash"]
 

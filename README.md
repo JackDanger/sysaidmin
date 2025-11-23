@@ -1,18 +1,15 @@
 # Sysaidmin
 
-SYSAIDMIN is a minimal terminal-first LLM client for sysadmin workflows. It keeps the planning-first logic from the original prototype but focuses on a streamlined TUI plus sysadmin safety features (allowlists, dry-run execution, filesystem backups, and session logging).
+SYSAIDMIN is like if you squished Claude Code down so you felt okay `wget`-ing it onto your server.
+It's got planning logic, a terminal UI, and some partially-tested safety features (YMMV).
 
 ## Quick start
 
 ```bash
-# cargo build
-just build
+cargo build
 
-# run (requires SYSAIDMIN_API_KEY or config file)
+# run requires SYSAIDMIN_API_KEY or config file
 cargo run -p sysaidmin
-
-# local package (host toolchain)
-just deb    # produces target/debian/sysaidmin_*.deb
 ```
 
 ## Configuration
@@ -39,6 +36,7 @@ Env overrides & runtime options:
 - `--model <name>` CLI flag overrides the interactive picker and uses the specified model immediately. Without the flag, the app fetches the current Anthropic model list on startup and lets you choose one before launching the TUI.
 
 > **Note:** The config file is parsed as TOML; string values (like API keys) **must** be quoted (`"sk-..."`). Unquoted keys will be rejected with a parse error that points to the config file.
+  **Double Note:** I just use ENV vars, don't use the config unless you need it
 
 ## Features
 
@@ -48,14 +46,6 @@ Env overrides & runtime options:
 - **Session exports**: Every plan snapshot is written to JSON, and logs stream to `~/.local/share/sysaidmin`.
 - **Packaging**: `cargo-deb` metadata ships a single `/usr/bin/sysaidmin` binary ready for Debian-based systems.
 
-## Debian 12 packaging (Docker)
+## Packaging via Docker
 
-If you’re on macOS (or otherwise lack a Debian host), build the `.deb` from an exact Debian 12 Bookworm container:
-
-```bash
-./build-deb-docker.sh
-# artifacts end up under dist/debian/
-```
-
-The script uses `Dockerfile.debian12`, which installs rustup + cargo-deb inside `debian:12-slim`, builds with `cargo build --release --locked`, then runs `cargo deb`. The resulting package mirrors the Bookworm runtime environment.
-
+Just run `./build.sh` and it'll create the full matrix of `.deb` packages and binaries for each popular architecture.

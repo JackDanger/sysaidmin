@@ -31,9 +31,6 @@ name = "sysaidmin"
 maintainer = "You, if you're seeing this."
 license-file = "../LICENSE.md"
 depends = "libstdc++6 (>= 12), libc6 (>= 2.31)"
-assets = [
-    ["target/release/sysaidmin", "usr/bin/sysaidmin", "755"]
-]
 copyright = """
 You have the right to copy. The name isn't even original anyway.
 """
