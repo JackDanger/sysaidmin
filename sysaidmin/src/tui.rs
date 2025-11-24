@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -62,9 +62,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
     loop {
         iteration_count += 1;
         // Only log iterations to file, not stderr (trace level)
-        log::trace!("Event loop iteration {}", iteration_count);
         
-        log::trace!("Drawing frame");
         terminal.draw(|frame| draw(frame, app))
             .context("Failed to draw frame")?;
 
@@ -72,10 +70,8 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::from_secs(0));
 
-        log::trace!("Polling for events (timeout: {:?})", timeout);
         if event::poll(timeout)
             .context("Failed to poll for events")? {
-            log::trace!("Event available, reading");
             match event::read()
                 .context("Failed to read event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -120,12 +116,21 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                             };
                         }
                         KeyCode::Enter if editing => {
-                            info!("Submitting prompt");
-                            app.submit_prompt();
+                            // Ctrl+Enter or Alt+Enter submits, plain Enter inserts newline
+                            if key.modifiers.contains(KeyModifiers::CONTROL) || 
+                               key.modifiers.contains(KeyModifiers::ALT) {
+                                info!("Submitting prompt (Ctrl/Alt+Enter)");
+                                app.submit_prompt();
+                            } else {
+                                log::trace!("Inserting newline");
+                                app.input.push('\n');
+                            }
                         }
                         KeyCode::Backspace if editing => {
                             log::trace!("Backspace pressed");
-                            app.input.pop();
+                            if !app.input.is_empty() {
+                                app.input.pop();
+                            }
                         }
                         KeyCode::Char(c) if editing => {
                             log::trace!("Character entered: {:?}", c);
@@ -157,12 +162,15 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 }
 
 fn draw(frame: &mut Frame, app: &App) {
+    // Calculate dynamic height for input area (up to 10 lines)
+    let input_height = calculate_input_height(app, frame.size().width);
+    
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
             Constraint::Length(5),
         ])
         .split(frame.size());
@@ -171,6 +179,58 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, main_chunks[1], app);
     draw_input(frame, main_chunks[2], app);
     draw_logs(frame, main_chunks[3], app);
+}
+
+fn calculate_input_height(app: &App, available_width: u16) -> u16 {
+    // Account for borders (left + right = 2) and title line (1)
+    let border_width = 2;
+    let title_height = 1;
+    let usable_width = available_width.saturating_sub(border_width);
+    
+    if usable_width < 10 {
+        return 3; // Minimum height (1 line + borders)
+    }
+    
+    // Calculate how many lines the wrapped text would take
+    let mut total_lines = 0;
+    
+    // Split by actual newlines first
+    for line in app.input.lines() {
+        if line.is_empty() {
+            total_lines += 1;
+        } else {
+            // Calculate wrapping for this line
+            let mut current_width = 0;
+            total_lines += 1; // At least one line for this content
+            
+            for ch in line.chars() {
+                // Approximate character width (ASCII = 1, others = 2)
+                let char_width = if ch.is_ascii() { 1 } else { 2 };
+                
+                if current_width + char_width > usable_width as usize {
+                    total_lines += 1;
+                    current_width = char_width;
+                } else {
+                    current_width += char_width;
+                }
+            }
+        }
+    }
+    
+    // If input ends with newline, add one more line for cursor
+    if app.input.ends_with('\n') {
+        total_lines += 1;
+    }
+    
+    // If empty, we still need at least one line
+    if total_lines == 0 {
+        total_lines = 1;
+    }
+    
+    // Clamp between 3 (minimum: 1 line + borders) and 12 (max 10 content lines + borders + title)
+    // Max content lines is 10, so max total height is 10 + 2 (borders) = 12
+    let height = (total_lines + title_height).min(12).max(3);
+    height as u16
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -243,12 +303,22 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let title = match app.input_mode {
-        InputMode::Prompt => "Prompt (Enter=plan, q=quit)",
+        InputMode::Prompt => "Prompt (Ctrl+Enter=plan, Enter=newline, q=quit)",
         InputMode::Logs => "Prompt (logs focused - press Tab to edit)",
     };
-    let input = Paragraph::new(app.input.as_str())
+    
+    // Use the input string directly - Paragraph will handle wrapping automatically
+    // and respect explicit newlines
+    let input_text = if app.input.is_empty() {
+        " " // Show at least a space so the area is visible
+    } else {
+        app.input.as_str()
+    };
+    
+    let input = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Cyan))
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
 }
 
