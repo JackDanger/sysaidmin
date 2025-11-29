@@ -18,6 +18,7 @@ use ratatui::{
 };
 
 use crate::app::{App, InputMode};
+use crate::executor::ExecutionResult;
 use crate::task::{Task, TaskDetail, TaskStatus};
 
 const TICK_RATE: Duration = Duration::from_millis(200);
@@ -277,6 +278,24 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("> ");
     frame.render_widget(list, chunks[0]);
 
+    // Split Details pane into top (details) and bottom (results)
+    // If results exist, give them at least half the space, otherwise give details all space
+    let has_results = app.execution_results.contains_key(&app.selected);
+    let constraints = if has_results {
+        // Results exist: give details minimum space, results get the rest (up to half)
+        // This will push details up when results are long
+        [Constraint::Min(5), Constraint::Min(0)]
+    } else {
+        // No results: details get all space
+        [Constraint::Min(0), Constraint::Length(0)]
+    };
+    
+    let detail_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(chunks[1]);
+
+    // Top: Task details
     let detail_text = app
         .tasks
         .get(app.selected)
@@ -286,7 +305,53 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     let detail = Paragraph::new(detail_text)
         .block(Block::default().borders(Borders::ALL).title("Details"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(detail, chunks[1]);
+    frame.render_widget(detail, detail_chunks[0]);
+
+    // Bottom: Execution results (only render if results exist and we have space)
+    if has_results && detail_chunks[1].height > 2 {
+        let result_text = app
+            .execution_results
+            .get(&app.selected)
+            .map(format_execution_result)
+            .unwrap_or_else(|| vec![Line::raw("No execution results")]);
+
+        let result = Paragraph::new(result_text)
+            .block(Block::default().borders(Borders::ALL).title("Results"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(result, detail_chunks[1]);
+    }
+}
+
+fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Exit Code: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{}", result.status)),
+        ]),
+    ];
+
+    if !result.stdout.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("STDOUT:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
+        ]));
+        // Split stdout into lines, keeping long lines for wrapping
+        for line in result.stdout.lines() {
+            lines.push(Line::raw(line.to_string()));
+        }
+    }
+
+    if !result.stderr.trim().is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("STDERR:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)),
+        ]));
+        // Split stderr into lines
+        for line in result.stderr.lines() {
+            lines.push(Line::raw(line.to_string()));
+        }
+    }
+
+    lines
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {

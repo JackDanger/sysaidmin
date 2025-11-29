@@ -1,10 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
+use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 
 use crate::allowlist::Allowlist;
 use crate::api::AnthropicClient;
 use crate::config::AppConfig;
+use crate::conversation::{ConversationEntry, ConversationLogger};
 use crate::executor::{ExecutionResult, Executor, FileEditOutcome};
 use crate::parser;
 use crate::session::SessionStore;
@@ -23,12 +26,14 @@ pub struct App {
     pub input_mode: InputMode,
     pub logs: Vec<String>,
     pub summary: Option<String>,
+    pub execution_results: HashMap<usize, ExecutionResult>, // task index -> execution result
     config: AppConfig,
     client: AnthropicClient,
     allowlist: Allowlist,
     executor: Executor,
     session: SessionStore,
     approval_queue: VecDeque<usize>,
+    conversation: ConversationLogger,
 }
 
 impl App {
@@ -41,6 +46,20 @@ impl App {
     ) -> Self {
         info!("Creating new App instance");
         debug!("App config: dry_run={}, offline_mode={}", config.dry_run, config.offline_mode);
+        
+        // Initialize conversation logger
+        let conversation_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("sysaidmin.conversation.jsonl");
+        let conversation = ConversationLogger::new(conversation_path.clone())
+            .unwrap_or_else(|e| {
+                warn!("Failed to create conversation logger: {}", e);
+                // Create a dummy logger that does nothing
+                ConversationLogger::new(PathBuf::from("/dev/null"))
+                    .expect("Failed to create dummy conversation logger")
+            });
+        info!("Conversation logger initialized at: {}", conversation_path.display());
+        
         Self {
             tasks: Vec::new(),
             selected: 0,
@@ -48,12 +67,14 @@ impl App {
             input_mode: InputMode::Prompt,
             logs: Vec::new(),
             summary: None,
+            execution_results: HashMap::new(),
             config,
             client,
             allowlist,
             executor,
             session,
             approval_queue: VecDeque::new(),
+            conversation,
         }
     }
 
@@ -66,6 +87,12 @@ impl App {
         info!("Submitting prompt: {}", prompt);
         self.log(format!("Requesting plan for: {}", prompt));
         
+        // Log prompt to conversation
+        let _ = self.conversation.log(ConversationEntry::Prompt {
+            timestamp: Utc::now().to_rfc3339(),
+            prompt: prompt.clone(),
+        });
+        
         trace!("Calling API client.plan()");
         match self.client.plan(&prompt) {
             Ok(response_text) => {
@@ -77,9 +104,16 @@ impl App {
                     Ok(parsed) => {
                         info!("Plan parsed successfully: {} tasks", parsed.tasks.len());
                         self.summary = parsed.summary.clone();
-                        self.tasks = parsed.tasks;
+                        self.tasks = parsed.tasks.clone();
                         self.input.clear();
                         self.selected = 0;
+                        
+                        // Log plan to conversation
+                        let _ = self.conversation.log(ConversationEntry::Plan {
+                            timestamp: Utc::now().to_rfc3339(),
+                            summary: parsed.summary.clone(),
+                            task_count: parsed.tasks.len(),
+                        });
                         
                         info!("Evaluating {} tasks against allowlist", self.tasks.len());
                         for (idx, task) in self.tasks.iter_mut().enumerate() {
@@ -162,6 +196,10 @@ impl App {
             (task.detail.clone(), desc)
         };
 
+        let task_id = self.tasks.get(self.selected)
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        
         match detail {
             TaskDetail::Command(cmd) => {
                 info!("Running command: {} (shell: {})", cmd.command, cmd.shell);
@@ -170,6 +208,22 @@ impl App {
                     Ok(result) => {
                         info!("Command executed successfully: exit_code={}, stdout_len={}, stderr_len={}", 
                               result.status, result.stdout.len(), result.stderr.len());
+                        
+                        // Store result for display
+                        self.execution_results.insert(self.selected, result.clone());
+                        
+                        // Log to conversation
+                        let _ = self.conversation.log(ConversationEntry::Command {
+                            timestamp: Utc::now().to_rfc3339(),
+                            task_id: task_id.clone(),
+                            description: description.clone(),
+                            command: cmd.command.clone(),
+                            shell: cmd.shell.clone(),
+                            exit_code: result.status,
+                            stdout: result.stdout.clone(),
+                            stderr: result.stderr.clone(),
+                        });
+                        
                         self.mark_complete_with_log(
                             format!("Executed '{}' exit {}", description, result.status),
                             Some(result),
@@ -193,6 +247,17 @@ impl App {
                         if let Some(ref backup) = outcome.backup_path {
                             info!("Backup created: {}", backup.display());
                         }
+                        
+                        // Log to conversation
+                        let _ = self.conversation.log(ConversationEntry::FileEdit {
+                            timestamp: Utc::now().to_rfc3339(),
+                            task_id: task_id.clone(),
+                            description: description.clone(),
+                            path: outcome.path.display().to_string(),
+                            backup_path: outcome.backup_path.as_ref()
+                                .map(|p| p.display().to_string()),
+                        });
+                        
                         self.mark_complete_with_log(
                             format!(
                                 "Wrote {} (backup: {})",
@@ -217,6 +282,15 @@ impl App {
             }
             TaskDetail::Note { details } => {
                 info!("Processing note task: {}", details);
+                
+                // Log to conversation
+                let _ = self.conversation.log(ConversationEntry::Note {
+                    timestamp: Utc::now().to_rfc3339(),
+                    task_id: task_id.clone(),
+                    description: description.clone(),
+                    details: details.clone(),
+                });
+                
                 self.log(format!("Note: {}", details));
                 if let Some(task) = self.tasks.get_mut(self.selected) {
                     task.status = TaskStatus::Complete;

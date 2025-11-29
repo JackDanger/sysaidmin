@@ -1,0 +1,37 @@
+FROM debian:12-slim
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH \
+    CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc \
+    CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
+
+# Base system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl build-essential pkg-config libssl-dev git dpkg-dev \
+    gcc-riscv64-linux-gnu libc6-dev-riscv64-cross && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable && \
+    cargo install cargo-deb
+
+WORKDIR /app
+
+# Copy workspace files and project structure
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE.md ./
+COPY sysaidmin ./sysaidmin
+
+# Download dependencies (cached layer if Cargo.toml/Cargo.lock don't change)
+RUN rustup target add riscv64gc-unknown-linux-gnu && \
+    cargo fetch --locked
+
+# Build and package
+RUN cargo build --workspace --locked --release --target riscv64gc-unknown-linux-gnu && \
+    DEB_BUILD_ARCH=riscv64 cargo deb -p sysaidmin --target riscv64gc-unknown-linux-gnu --no-build && \
+    mkdir -p /app/artifacts/riscv64/bin /app/artifacts/riscv64/deb && \
+    install -Dm755 target/riscv64gc-unknown-linux-gnu/release/sysaidmin /app/artifacts/riscv64/bin/sysaidmin && \
+    cp target/riscv64gc-unknown-linux-gnu/debian/*.deb /app/artifacts/riscv64/deb/
+
+ENTRYPOINT ["/bin/bash"]
+

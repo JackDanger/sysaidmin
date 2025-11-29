@@ -12,6 +12,7 @@ pub struct Executor {
     dry_run: bool,
 }
 
+#[derive(Clone)]
 pub struct ExecutionResult {
     pub status: i32,
     pub stdout: String,

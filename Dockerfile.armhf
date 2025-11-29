@@ -1,0 +1,37 @@
+FROM debian:12-slim
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+
+# Base system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl build-essential pkg-config libssl-dev git dpkg-dev \
+    gcc-arm-linux-gnueabihf libc6-dev-armhf-cross && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable && \
+    cargo install cargo-deb
+
+WORKDIR /app
+
+# Copy workspace files and project structure
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE.md ./
+COPY sysaidmin ./sysaidmin
+
+# Download dependencies (cached layer if Cargo.toml/Cargo.lock don't change)
+RUN rustup target add armv7-unknown-linux-gnueabihf && \
+    cargo fetch --locked
+
+# Build and package
+RUN cargo build --workspace --locked --release --target armv7-unknown-linux-gnueabihf && \
+    DEB_BUILD_ARCH=armhf cargo deb -p sysaidmin --target armv7-unknown-linux-gnueabihf --no-build && \
+    mkdir -p /app/artifacts/armhf/bin /app/artifacts/armhf/deb && \
+    install -Dm755 target/armv7-unknown-linux-gnueabihf/release/sysaidmin /app/artifacts/armhf/bin/sysaidmin && \
+    cp target/armv7-unknown-linux-gnueabihf/debian/*.deb /app/artifacts/armhf/deb/
+
+ENTRYPOINT ["/bin/bash"]
+

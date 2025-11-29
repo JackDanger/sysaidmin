@@ -2,6 +2,7 @@ mod allowlist;
 mod api;
 mod app;
 mod config;
+mod conversation;
 mod executor;
 mod logger;
 mod models;

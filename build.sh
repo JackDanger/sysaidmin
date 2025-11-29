@@ -3,44 +3,26 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST_DIR="${ROOT_DIR}/dist"
-ARCH_MATRIX=(
-  "amd64:x86_64-unknown-linux-gnu"
-  "arm64:aarch64-unknown-linux-gnu"
-  "armhf:armv7-unknown-linux-gnueabihf"
-  "riscv64:riscv64gc-unknown-linux-gnu"
-)
+ARCHES=("amd64" "arm64" "armhf" "riscv64")
 
-if [[ -n "${SYSAIDMIN_ARCH_MATRIX:-}" ]]; then
-  IFS=' ' read -r -a ARCH_MATRIX <<< "${SYSAIDMIN_ARCH_MATRIX}"
-fi
-
-REQUESTED_ARCHES=()
 if [[ -n "${SYSAIDMIN_ARCHES:-}" ]]; then
-  read -r -a REQUESTED_ARCHES <<< "${SYSAIDMIN_ARCHES}"
+  read -r -a ARCHES <<< "${SYSAIDMIN_ARCHES}"
 fi
 
 mkdir -p "${DIST_DIR}"
 echo "[*] Building multi-arch artifacts into ${DIST_DIR}"
 
-for entry in "${ARCH_MATRIX[@]}"; do
-  IFS=':' read -r deb_arch rust_target <<< "${entry}"
-  if [[ ${#REQUESTED_ARCHES[@]} -gt 0 ]]; then
-    skip=true
-    for requested in "${REQUESTED_ARCHES[@]}"; do
-      if [[ "${requested}" == "${deb_arch}" ]]; then
-        skip=false
-        break
-      fi
-    done
-    $skip && continue
+for deb_arch in "${ARCHES[@]}"; do
+  dockerfile="${ROOT_DIR}/Dockerfile.${deb_arch}"
+  if [[ ! -f "${dockerfile}" ]]; then
+    echo "[!] Error: Dockerfile not found: ${dockerfile}"
+    exit 1
   fi
 
   image_name="sysaidmin-deb-${deb_arch}"
-  echo "[*] (${deb_arch}) building via ${rust_target}"
+  echo "[*] (${deb_arch}) building with Dockerfile.${deb_arch}"
   docker build \
-    --build-arg "DEB_ARCH=${deb_arch}" \
-    --build-arg "RUST_TARGET=${rust_target}" \
-    -f "${ROOT_DIR}/Dockerfile.debian12" \
+    -f "${dockerfile}" \
     -t "${image_name}" \
     "${ROOT_DIR}"
 
