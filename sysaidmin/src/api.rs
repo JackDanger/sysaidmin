@@ -5,6 +5,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
+use crate::tokenizer;
 
 const SYS_PROMPT: &str = r#"
 You are an LLM for sysadmins to when fixing their servers. Produce structured JSON that captures a
@@ -77,12 +78,12 @@ impl AnthropicClient {
         })
     }
 
-    pub fn plan(&self, prompt: &str) -> Result<String> {
-        info!("Requesting plan from API (prompt length: {} chars)", prompt.len());
+    pub fn plan(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
+        info!("Requesting plan from API (prompt length: {} chars, history entries: {})", prompt.len(), history.len());
         match &self.inner {
             ClientMode::Remote(remote) => {
                 debug!("Using remote API client");
-                remote.plan(prompt)
+                remote.plan(prompt, history)
             }
             ClientMode::Offline => {
                 warn!("Using offline mock plan");
@@ -93,19 +94,117 @@ impl AnthropicClient {
 }
 
 impl RemoteClient {
-    fn plan(&self, prompt: &str) -> Result<String> {
-        trace!("Building API request");
-        let request = MessageRequest {
-            model: &self.model,
-            max_tokens: 1024,
-            system: SYS_PROMPT,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: vec![ContentBlock {
-                    r#type: "text",
-                    text: prompt,
-                }],
+    fn plan(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
+        trace!("Building API request with {} history entries", history.len());
+        
+        // Truncate history to fit within token budget
+        // Anthropic API typically has limits around 200k tokens for context
+        // Reserve space for system prompt, current prompt, and response
+        const MAX_CONTEXT_TOKENS: usize = 180_000; // Conservative limit
+        let system_tokens = tokenizer::approximate_tokens(SYS_PROMPT);
+        let prompt_tokens = tokenizer::approximate_tokens(prompt);
+        
+        let truncated_history = tokenizer::truncate_history(
+            history,
+            MAX_CONTEXT_TOKENS,
+            system_tokens,
+            prompt_tokens,
+        );
+        
+        info!(
+            "History: {} entries -> {} entries after truncation ({} -> {} tokens)",
+            history.len(),
+            truncated_history.len(),
+            history.iter().map(tokenizer::entry_tokens).sum::<usize>(),
+            truncated_history.iter().map(tokenizer::entry_tokens).sum::<usize>()
+        );
+        
+        // Build conversation messages from truncated history
+        let mut messages = Vec::new();
+        
+        for entry in &truncated_history {
+            match entry {
+                crate::conversation::ConversationEntry::Prompt { prompt: p, .. } => {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: p.clone(),
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Plan { response, summary, task_count, .. } => {
+                    // Use full response if available, otherwise construct summary
+                    let plan_text = if let Some(resp) = response {
+                        resp.clone()
+                    } else if let Some(summary) = summary {
+                        format!("Plan with {} tasks: {}", task_count, summary)
+                    } else {
+                        format!("Plan with {} tasks", task_count)
+                    };
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: plan_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Command { description, command, exit_code, stdout, stderr, .. } => {
+                    // Include execution results as context
+                    let mut context = format!("Executed: {} (command: {})\nExit code: {}", description, command, exit_code);
+                    if !stdout.trim().is_empty() {
+                        context.push_str(&format!("\nSTDOUT:\n{}", stdout));
+                    }
+                    if !stderr.trim().is_empty() {
+                        context.push_str(&format!("\nSTDERR:\n{}", stderr));
+                    }
+                    let message_text = format!("[Execution result] {}", context);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::FileEdit { description, path, .. } => {
+                    let message_text = format!("[File edit completed] {}: {}", description, path);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Note { description, details, .. } => {
+                    let message_text = format!("[Note] {}: {}", description, details);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+            }
+        }
+        
+        // Add current prompt
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock {
+                r#type: "text".to_string(),
+                text: prompt.to_string(),
             }],
+        });
+        
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: 1024,
+            system: SYS_PROMPT.to_string(),
+            messages,
             temperature: Some(0.0),
         };
 
@@ -204,26 +303,26 @@ fn mock_plan(prompt: &str) -> String {
 }
 
 #[derive(Serialize)]
-struct MessageRequest<'a> {
-    model: &'a str,
+struct MessageRequest {
+    model: String,
     max_tokens: u32,
-    system: &'a str,
-    messages: Vec<ChatMessage<'a>>,
+    system: String,
+    messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
 }
 
 #[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: Vec<ContentBlock<'a>>,
+struct ChatMessage {
+    role: String,
+    content: Vec<ContentBlock>,
 }
 
 #[derive(Serialize)]
-struct ContentBlock<'a> {
+struct ContentBlock {
     #[serde(rename = "type")]
-    r#type: &'a str,
-    text: &'a str,
+    r#type: String,
+    text: String,
 }
 
 #[derive(Deserialize)]

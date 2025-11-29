@@ -117,14 +117,20 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                             };
                         }
                         KeyCode::Enter if editing => {
-                            // Ctrl+Enter or Alt+Enter submits, plain Enter inserts newline
-                            if key.modifiers.contains(KeyModifiers::CONTROL) || 
+                            // Shift+Enter or Ctrl+Enter adds newline, plain Enter submits
+                            if key.modifiers.contains(KeyModifiers::SHIFT) || 
+                               key.modifiers.contains(KeyModifiers::CONTROL) ||
                                key.modifiers.contains(KeyModifiers::ALT) {
-                                info!("Submitting prompt (Ctrl/Alt+Enter)");
-                                app.submit_prompt();
-                            } else {
-                                log::trace!("Inserting newline");
+                                log::trace!("Inserting newline (Shift/Ctrl/Alt+Enter)");
                                 app.input.push('\n');
+                            } else {
+                                // Plain Enter submits if input is not empty
+                                if !app.input.trim().is_empty() {
+                                    info!("Submitting prompt (Enter)");
+                                    app.submit_prompt();
+                                } else {
+                                    log::trace!("Enter pressed but input is empty, ignoring");
+                                }
                             }
                         }
                         KeyCode::Backspace if editing => {
@@ -368,7 +374,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let title = match app.input_mode {
-        InputMode::Prompt => "Prompt (Ctrl+Enter=plan, Enter=newline, q=quit)",
+        InputMode::Prompt => "Prompt (Enter=submit, Shift+Enter=newline, q=quit)",
         InputMode::Logs => "Prompt (logs focused - press Tab to edit)",
     };
     
