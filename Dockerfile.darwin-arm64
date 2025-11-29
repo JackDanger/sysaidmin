@@ -1,0 +1,75 @@
+FROM debian:12-slim
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH \
+    OSXCROSS_ROOT=/opt/osxcross \
+    TARGET_DIR=aarch64-apple-darwin
+
+# Base system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl build-essential pkg-config libssl-dev git cmake \
+    clang libxml2-dev libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+    libsqlite3-dev libncurses5-dev libncursesw5-dev xz-utils tk-dev libffi-dev \
+    liblzma-dev python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+
+# Install osxcross
+# Note: macOS SDK must be provided via build arg MACOS_SDK_URL or copied into build context as MacOSX.sdk.tar.xz
+# IMPORTANT: osxcross has limited SDK support - SDK versions 11.x-13.x typically work
+# For newer SDKs (14.x+), consider building natively on macOS instead
+ARG MACOS_SDK_URL
+RUN mkdir -p ${OSXCROSS_ROOT} && \
+    cd /tmp && \
+    git clone https://github.com/tpoechtrager/osxcross.git && \
+    cd osxcross && \
+    if [ -f /app/MacOSX.sdk.tar.xz ]; then \
+        cp /app/MacOSX.sdk.tar.xz ./tarballs/ && \
+        UNATTENDED=1 ./build.sh || (echo "ERROR: SDK version unsupported by osxcross" && echo "osxcross typically supports SDK 11.x-13.x" && echo "For newer SDKs, build natively on macOS: cargo build --target aarch64-apple-darwin" && exit 1); \
+        rm -rf ./tarballs/*; \
+    elif [ -n "${MACOS_SDK_URL}" ]; then \
+        curl -L "${MACOS_SDK_URL}" -o ./tarballs/MacOSX.sdk.tar.xz && \
+        UNATTENDED=1 ./build.sh || (echo "ERROR: SDK version unsupported by osxcross" && echo "osxcross typically supports SDK 11.x-13.x" && echo "For newer SDKs, build natively on macOS: cargo build --target aarch64-apple-darwin" && exit 1); \
+        rm -rf ./tarballs/*; \
+    else \
+        echo "Error: macOS SDK required" && \
+        echo "Provide MACOS_SDK_URL build arg, or copy MacOSX.sdk.tar.xz into build context" && \
+        echo "macOS SDK can be obtained from Xcode Command Line Tools or Apple Developer portal" && \
+        echo "Note: osxcross typically supports SDK 11.x-13.x only" && \
+        exit 1; \
+    fi && \
+    mv /tmp/osxcross/target ${OSXCROSS_ROOT}/target && \
+    mv /tmp/osxcross/osxcross-macports ${OSXCROSS_ROOT}/osxcross-macports && \
+    rm -rf /tmp/osxcross
+
+# Set up osxcross environment
+ENV PATH=${OSXCROSS_ROOT}/target/bin:${PATH}
+
+WORKDIR /app
+
+# Copy workspace files and project structure
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE.md ./
+COPY sysaidmin ./sysaidmin
+
+# Download dependencies (cached layer if Cargo.toml/Cargo.lock don't change)
+RUN rustup target add aarch64-apple-darwin && \
+    cargo fetch --locked
+
+# Build binary
+# Detect osxcross clang binary name (varies by SDK version) and build
+RUN CLANG_BIN=$(ls ${OSXCROSS_ROOT}/target/bin/aarch64-apple-darwin*-clang 2>/dev/null | head -1) && \
+    if [ -z "${CLANG_BIN}" ]; then \
+        echo "Error: Could not find osxcross clang binary" && exit 1; \
+    fi && \
+    export CC_aarch64_apple_darwin="${CLANG_BIN}" && \
+    export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER="${CLANG_BIN}" && \
+    export CARGO_TARGET_AARCH64_APPLE_DARWIN_AR="${OSXCROSS_ROOT}/target/bin/aarch64-apple-darwin-ar" && \
+    cargo build --workspace --locked --release --target aarch64-apple-darwin && \
+    mkdir -p /app/artifacts/darwin-arm64/bin && \
+    install -Dm755 target/aarch64-apple-darwin/release/sysaidmin /app/artifacts/darwin-arm64/bin/sysaidmin
+
+ENTRYPOINT ["/bin/bash"]
+

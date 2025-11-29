@@ -1,2 +1,5 @@
 target
 dist
+MacOSX.sdk.tar.xz
+sysaidmin.log
+sysaidmin.conversation.jsonl

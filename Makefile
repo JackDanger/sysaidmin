@@ -22,11 +22,14 @@ help: ## Show this help message
 	@echo "Architecture-specific targets:"
 	@echo "  sysaidmin-<arch>        Build binary for architecture (amd64, arm64, armhf, riscv64)"
 	@echo "  sysaidmin-<arch>.deb    Build .deb package for architecture"
+	@echo "  sysaidmin-darwin-arm64  Build macOS ARM64 binary (requires macOS SDK)"
+	@echo "  sysaidmin-darwin-macos  Alias for sysaidmin-darwin-arm64"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build              Build for native architecture"
 	@echo "  make sysaidmin-amd64    Build amd64 binary"
 	@echo "  make sysaidmin-arm64.deb Build arm64 .deb package"
+	@echo "  make sysaidmin-darwin-macos Build macOS ARM64 binary"
 	@echo "  make build-all          Build all architectures"
 
 .PHONY: build
@@ -77,6 +80,15 @@ sysaidmin-armhf.deb: sysaidmin-armhf ## Build armhf .deb package
 
 sysaidmin-riscv64.deb: sysaidmin-riscv64 ## Build riscv64 .deb package
 	@echo ".deb package available at: $(DIST_DIR)/riscv64/deb/$(BINARY_NAME)_*.deb"
+
+# macOS ARM64 target (requires macOS SDK)
+.PHONY: sysaidmin-darwin-arm64 sysaidmin-darwin-macos
+sysaidmin-darwin-arm64: ## Build macOS ARM64 binary (requires macOS SDK - see build-darwin.sh)
+	@echo "Building macOS ARM64 binary..."
+	@./build-darwin.sh
+	@echo "Binary available at: $(DIST_DIR)/darwin-arm64/bin/$(BINARY_NAME)"
+
+sysaidmin-darwin-macos: sysaidmin-darwin-arm64 ## Alias for sysaidmin-darwin-arm64
 
 .PHONY: test
 test: ## Run all tests
