@@ -4,11 +4,14 @@ mod app;
 mod config;
 mod conversation;
 mod executor;
+mod hooks;
 mod logger;
 mod models;
 mod parser;
 mod session;
 mod task;
+mod tokenizer;
+mod transcript;
 mod tui;
 
 use std::panic;

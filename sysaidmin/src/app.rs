@@ -87,14 +87,22 @@ impl App {
         info!("Submitting prompt: {}", prompt);
         self.log(format!("Requesting plan for: {}", prompt));
         
+        // Load conversation history
+        let history = self.conversation.load_history()
+            .unwrap_or_else(|e| {
+                warn!("Failed to load conversation history: {}", e);
+                vec![]
+            });
+        debug!("Loaded {} conversation history entries", history.len());
+        
         // Log prompt to conversation
         let _ = self.conversation.log(ConversationEntry::Prompt {
             timestamp: Utc::now().to_rfc3339(),
             prompt: prompt.clone(),
         });
         
-        trace!("Calling API client.plan()");
-        match self.client.plan(&prompt) {
+        trace!("Calling API client.plan() with conversation history");
+        match self.client.plan(&prompt, &history) {
             Ok(response_text) => {
                 info!("Received plan response ({} bytes)", response_text.len());
                 trace!("Response preview: {}", response_text.chars().take(200).collect::<String>());
@@ -108,11 +116,12 @@ impl App {
                         self.input.clear();
                         self.selected = 0;
                         
-                        // Log plan to conversation
+                        // Log plan to conversation (include full response for context)
                         let _ = self.conversation.log(ConversationEntry::Plan {
                             timestamp: Utc::now().to_rfc3339(),
                             summary: parsed.summary.clone(),
                             task_count: parsed.tasks.len(),
+                            response: Some(response_text.clone()),
                         });
                         
                         info!("Evaluating {} tasks against allowlist", self.tasks.len());
