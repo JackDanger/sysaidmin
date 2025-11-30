@@ -30,6 +30,23 @@ Always respond with ONLY JSON following this shape:
 }
 Never include markdown code fences or commentary outside JSON.
 Keep shells POSIX compatible and focus on investigative/sysadmin workflows.
+
+IMPORTANT: Use "note" tasks sparingly - only for critical context that can't be conveyed in the summary.
+Prefer actionable "command" tasks over informational notes. If you must use notes, provide a clear, 
+descriptive "description" field (not just "Note").
+"#;
+
+const SYNTHESIS_PROMPT: &str = r#"
+You are an LLM assistant helping sysadmins analyze server information and execution results.
+When given execution results from commands or file operations, provide a clear, concise analysis.
+
+Focus on:
+- Identifying key findings and patterns
+- Highlighting important information
+- Explaining what the results mean
+- Suggesting next steps if appropriate
+
+Respond in plain text (not JSON). Be direct and informative.
 "#;
 
 pub struct AnthropicClient {
@@ -88,6 +105,20 @@ impl AnthropicClient {
             ClientMode::Offline => {
                 warn!("Using offline mock plan");
                 Ok(mock_plan(prompt))
+            }
+        }
+    }
+
+    pub fn synthesize(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
+        info!("Requesting synthesis from API (prompt length: {} chars, history entries: {})", prompt.len(), history.len());
+        match &self.inner {
+            ClientMode::Remote(remote) => {
+                debug!("Using remote API client for synthesis");
+                remote.synthesize(prompt, history)
+            }
+            ClientMode::Offline => {
+                warn!("Using offline mock synthesis");
+                Ok(format!("Mock analysis for: {}", prompt.chars().take(100).collect::<String>()))
             }
         }
     }
@@ -200,16 +231,18 @@ impl RemoteClient {
             }],
         });
         
+        // Use maximum tokens to avoid truncation - most Claude models support up to 16384
+        // This ensures we get the complete response without artificial limits
         let request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: 1024,
+            max_tokens: 16384, // Maximum for most Claude models - ensures complete responses
             system: SYS_PROMPT.to_string(),
             messages,
             temperature: Some(0.0),
         };
 
         info!("Sending POST request to {}", self.api_url);
-        trace!("Request model: {}, max_tokens: {}", self.model, 1024);
+        trace!("Request model: {}, max_tokens: {}", self.model, 16384);
         let resp = self
             .http
             .post(&self.api_url)
@@ -220,11 +253,17 @@ impl RemoteClient {
         let status = resp.status();
         info!("Received response: status={}", status.as_u16());
         
-        trace!("Reading response body");
+        trace!("Reading complete response body");
+        // Read the entire response body - resp.text() reads until EOF, ensuring we get everything
         let raw_body = resp
             .text()
             .context("failed to read Anthropic response body")?;
         debug!("Response body length: {} bytes", raw_body.len());
+        
+        // Verify we got a complete response (not empty)
+        if raw_body.is_empty() {
+            anyhow::bail!("Received empty response body from Anthropic API");
+        }
 
         if !status.is_success() {
             error!("API request failed with status {}", status.as_u16());
@@ -252,6 +291,14 @@ impl RemoteClient {
         let body: MessageResponse =
             serde_json::from_str(&raw_body).context("failed to decode Anthropic response body")?;
         
+        // Check if response was truncated due to max_tokens
+        if let Some(ref stop_reason) = body.stop_reason {
+            if stop_reason == "max_tokens" {
+                warn!("Response was truncated due to max_tokens limit. Consider increasing max_tokens or reducing prompt size.");
+                anyhow::bail!("Response truncated: API stopped generating due to max_tokens limit. Increase max_tokens or reduce input size.");
+            }
+        }
+        
         trace!("Extracting text content from response");
         let text = body
             .content
@@ -272,6 +319,149 @@ impl RemoteClient {
         }
         
         info!("Successfully extracted plan text ({} chars)", text.len());
+        Ok(text)
+    }
+
+    fn synthesize(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
+        trace!("Building synthesis API request with {} history entries", history.len());
+        
+        // Build conversation messages from history (same as plan)
+        let mut messages = Vec::new();
+        
+        for entry in history {
+            match entry {
+                crate::conversation::ConversationEntry::Prompt { prompt: p, .. } => {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: p.clone(),
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Plan { response, summary, task_count, .. } => {
+                    let plan_text = if let Some(resp) = response {
+                        resp.clone()
+                    } else if let Some(summary) = summary {
+                        format!("Plan with {} tasks: {}", task_count, summary)
+                    } else {
+                        format!("Plan with {} tasks", task_count)
+                    };
+                    messages.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: plan_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Command { description, command, exit_code, stdout, stderr, .. } => {
+                    let mut context = format!("Executed: {} (command: {})\nExit code: {}", description, command, exit_code);
+                    if !stdout.trim().is_empty() {
+                        context.push_str(&format!("\nSTDOUT:\n{}", stdout));
+                    }
+                    if !stderr.trim().is_empty() {
+                        context.push_str(&format!("\nSTDERR:\n{}", stderr));
+                    }
+                    let message_text = format!("[Execution result] {}", context);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::FileEdit { description, path, .. } => {
+                    let message_text = format!("[File edit completed] {}: {}", description, path);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+                crate::conversation::ConversationEntry::Note { description, details, .. } => {
+                    let message_text = format!("[Note] {}: {}", description, details);
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock {
+                            r#type: "text".to_string(),
+                            text: message_text,
+                        }],
+                    });
+                }
+            }
+        }
+        
+        // Add current synthesis prompt
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock {
+                r#type: "text".to_string(),
+                text: prompt.to_string(),
+            }],
+        });
+        
+        let request = MessageRequest {
+            model: self.model.clone(),
+            max_tokens: 2048, // More tokens for analysis
+            system: SYNTHESIS_PROMPT.to_string(),
+            messages,
+            temperature: Some(0.3), // Slightly higher for more natural analysis
+        };
+
+        info!("Sending synthesis POST request to {}", self.api_url);
+        trace!("Request model: {}, max_tokens: {}", self.model, 2048);
+        let resp = self
+            .http
+            .post(&self.api_url)
+            .json(&request)
+            .send()
+            .context("failed to send synthesis request")?;
+
+        let status = resp.status();
+        let raw_body = resp
+            .text()
+            .context("failed to read synthesis response body")?;
+
+        if !status.is_success() {
+            let snippet: String = raw_body
+                .chars()
+                .take(500)
+                .collect();
+            error!("Error response snippet: {}", snippet);
+            return Err(anyhow::anyhow!(
+                "Anthropic API {}: {}",
+                status.as_u16(),
+                snippet
+            ));
+        }
+
+        trace!("Parsing JSON response");
+        let body: MessageResponse =
+            serde_json::from_str(&raw_body).context("failed to decode Anthropic response body")?;
+
+        let text = body
+            .content
+            .iter()
+            .find_map(|block| {
+                if block.r#type == "text" {
+                    Some(block.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("")
+            .to_string();
+        
+        if text.is_empty() {
+            error!("Response contained no text content");
+            anyhow::bail!("Anthropic response did not include any text content");
+        }
+        
+        info!("Successfully extracted synthesis text ({} chars)", text.len());
         Ok(text)
     }
 }
@@ -328,6 +518,8 @@ struct ContentBlock {
 #[derive(Deserialize)]
 struct MessageResponse {
     content: Vec<ResponseBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>, // "end_turn", "max_tokens", "stop_sequence", etc.
 }
 
 #[derive(Deserialize)]

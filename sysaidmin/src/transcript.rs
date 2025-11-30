@@ -10,12 +10,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Transcript message following Claude API format
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptMessage {
     pub role: String, // "user" or "assistant"
     pub content: Vec<TranscriptContentBlock>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptContentBlock {
     #[serde(rename = "type")]
@@ -24,11 +26,13 @@ pub struct TranscriptContentBlock {
 }
 
 /// Transcript manager that maintains a JSONL transcript file
+#[allow(dead_code)]
 pub struct TranscriptManager {
     file: Arc<Mutex<File>>,
     path: PathBuf,
 }
 
+#[allow(dead_code)]
 impl TranscriptManager {
     pub fn new(transcript_path: PathBuf) -> std::io::Result<Self> {
         let file = OpenOptions::new()
