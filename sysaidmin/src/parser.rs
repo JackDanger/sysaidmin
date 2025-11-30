@@ -12,8 +12,8 @@ pub struct ParsedPlan {
 pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
     let cleaned = strip_code_fence(raw);
     let cleaned = cleaned.trim();
-    let payload = extract_json_segment(&cleaned)
-        .or_else(|| extract_json_segment(&cleaned.replace('\n', "")));
+    let payload =
+        extract_json_segment(&cleaned).or_else(|| extract_json_segment(&cleaned.replace('\n', "")));
     let segment = payload.unwrap_or_else(|| cleaned.to_string());
 
     let llm_plan: LlmPlan = serde_json::from_str(segment.trim()).map_err(|err| {
@@ -93,13 +93,18 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
                     .clone()
                     .or(entry.description.clone())
                     .unwrap_or_else(|| "Note".into());
-                let detail = TaskDetail::Note { details: details.clone() };
+                let detail = TaskDetail::Note {
+                    details: details.clone(),
+                };
                 // Use details as description if description is missing or just "Note"
-                let description = entry.description
+                let description = entry
+                    .description
                     .filter(|d| d != "Note" && !d.is_empty())
                     .unwrap_or_else(|| {
                         // Use first line of details, truncated to 60 chars
-                        details.lines().next()
+                        details
+                            .lines()
+                            .next()
                             .map(|line| {
                                 if line.len() > 60 {
                                     format!("{}…", &line[..60])

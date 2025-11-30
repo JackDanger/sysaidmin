@@ -40,27 +40,32 @@ impl Executor {
                 stderr: String::new(),
             });
         }
-        
-        trace!("Building command: shell={}, command={}", task.shell, task.command);
+
+        trace!(
+            "Building command: shell={}, command={}",
+            task.shell, task.command
+        );
         let mut cmd = Command::new(&task.shell);
         cmd.arg("-c").arg(&task.command);
         if let Some(cwd) = &task.cwd {
             info!("Setting working directory: {}", cwd);
             cmd.current_dir(cwd);
         }
-        
+
         trace!("Executing command");
         let output = cmd
             .output()
             .with_context(|| format!("failed running shell command '{}'", task.command))?;
-        
+
         let status = output.status.code().unwrap_or_default();
         let stdout_len = output.stdout.len();
         let stderr_len = output.stderr.len();
-        
-        info!("Command completed: exit_code={}, stdout_bytes={}, stderr_bytes={}", 
-              status, stdout_len, stderr_len);
-        
+
+        info!(
+            "Command completed: exit_code={}, stdout_bytes={}, stderr_bytes={}",
+            status, stdout_len, stderr_len
+        );
+
         if status != 0 {
             warn!("Command exited with non-zero status: {}", status);
             let stderr_preview = String::from_utf8_lossy(&output.stderr)
@@ -69,7 +74,7 @@ impl Executor {
                 .collect::<String>();
             debug!("Stderr preview: {}", stderr_preview);
         }
-        
+
         Ok(ExecutionResult {
             status,
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -78,16 +83,17 @@ impl Executor {
     }
 
     pub fn apply_file_edit(&self, edit: &FileEditTask) -> Result<FileEditOutcome> {
-        let path_str = edit
-            .path
-            .as_ref()
-            .ok_or_else(|| {
-                error!("File edit task missing path");
-                anyhow!("file edit missing path")
-            })?;
+        let path_str = edit.path.as_ref().ok_or_else(|| {
+            error!("File edit task missing path");
+            anyhow!("file edit missing path")
+        })?;
         let path = PathBuf::from(path_str);
-        info!("Applying file edit: {} ({} bytes)", path.display(), edit.new_text.len());
-        
+        info!(
+            "Applying file edit: {} ({} bytes)",
+            path.display(),
+            edit.new_text.len()
+        );
+
         if let Some(parent) = path.parent() {
             trace!("Creating parent directories: {}", parent.display());
             fs::create_dir_all(parent)
@@ -95,7 +101,11 @@ impl Executor {
         }
 
         if self.dry_run {
-            warn!("DRY-RUN: Would write {} bytes to {}", edit.new_text.len(), path.display());
+            warn!(
+                "DRY-RUN: Would write {} bytes to {}",
+                edit.new_text.len(),
+                path.display()
+            );
             return Ok(FileEditOutcome {
                 path,
                 backup_path: None,
@@ -107,11 +117,11 @@ impl Executor {
         if let Some(ref backup) = backup_path {
             info!("Backup created: {}", backup.display());
         }
-        
+
         trace!("Writing file content");
         fs::write(&path, edit.new_text.as_bytes())
             .with_context(|| format!("failed writing {}", path.display()))?;
-        
+
         info!("File edit completed successfully: {}", path.display());
 
         Ok(FileEditOutcome { path, backup_path })
@@ -122,18 +132,18 @@ impl Executor {
             trace!("File does not exist, no backup needed: {}", path.display());
             return Ok(None);
         }
-        
+
         info!("File exists, creating backup: {}", path.display());
         let backup = path.with_extension("sysaidmin.bak");
-        
+
         trace!("Reading original file");
         let contents =
             fs::read(path).with_context(|| format!("failed reading {}", path.display()))?;
-        
+
         trace!("Writing backup file");
         fs::write(&backup, contents)
             .with_context(|| format!("failed writing backup {}", backup.display()))?;
-        
+
         info!("Backup created successfully: {}", backup.display());
         Ok(Some(backup))
     }

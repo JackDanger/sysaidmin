@@ -26,32 +26,27 @@ const TICK_RATE: Duration = Duration::from_millis(200);
 pub fn run(app: &mut App) -> Result<()> {
     info!("Initializing TUI");
     trace!("Enabling raw mode");
-    enable_raw_mode()
-        .context("Failed to enable raw mode")?;
-    
+    enable_raw_mode().context("Failed to enable raw mode")?;
+
     trace!("Entering alternate screen");
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .context("Failed to enter alternate screen")?;
-    
+    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
+
     trace!("Creating terminal backend");
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)
-        .context("Failed to create terminal")?;
+    let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
     info!("Terminal initialized successfully");
 
     trace!("Starting main event loop");
     let res = run_loop(&mut terminal, app);
-    
+
     trace!("Cleaning up TUI");
-    disable_raw_mode()
-        .context("Failed to disable raw mode")?;
+    disable_raw_mode().context("Failed to disable raw mode")?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
         .context("Failed to leave alternate screen")?;
-    terminal.show_cursor()
-        .context("Failed to show cursor")?;
+    terminal.show_cursor().context("Failed to show cursor")?;
     info!("TUI cleanup completed");
-    
+
     res
 }
 
@@ -59,22 +54,24 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
     info!("Event loop started");
     let mut last_tick = Instant::now();
     let mut iteration_count = 0u64;
-    
+
     loop {
         iteration_count += 1;
         // Only log iterations to file, not stderr (trace level)
-        
-        terminal.draw(|frame| draw(frame, app))
+
+        // Check for asynchronous plan responses before drawing
+        app.poll_plan_response();
+
+        terminal
+            .draw(|frame| draw(frame, app))
             .context("Failed to draw frame")?;
 
         let timeout = TICK_RATE
             .checked_sub(last_tick.elapsed())
             .unwrap_or(Duration::from_secs(0));
 
-        if event::poll(timeout)
-            .context("Failed to poll for events")? {
-            match event::read()
-                .context("Failed to read event")? {
+        if event::poll(timeout).context("Failed to poll for events")? {
+            match event::read().context("Failed to read event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.has_pending_approval() {
                         info!("Handling approval key");
@@ -129,9 +126,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                         }
                         KeyCode::Enter if editing => {
                             // Shift+Enter or Ctrl+Enter adds newline, plain Enter submits
-                            if key.modifiers.contains(KeyModifiers::SHIFT) || 
-                               key.modifiers.contains(KeyModifiers::CONTROL) ||
-                               key.modifiers.contains(KeyModifiers::ALT) {
+                            if key.modifiers.contains(KeyModifiers::SHIFT)
+                                || key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT)
+                            {
                                 log::trace!("Inserting newline (Shift/Ctrl/Alt+Enter)");
                                 app.input.push('\n');
                             } else {
@@ -156,7 +154,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                         KeyCode::Enter if !editing => {
                             // Enter when not editing runs the selected task
                             info!("User pressed Enter to run selected task");
+
+                            // Force redraw before execution to show spinner
+                            terminal
+                                .draw(|frame| draw(frame, app))
+                                .context("Failed to draw before execution")?;
+
                             app.execute_selected();
+
+                            // Force redraw after execution completes
+                            terminal
+                                .draw(|frame| draw(frame, app))
+                                .context("Failed to draw after execution")?;
                         }
                         _ => {
                             log::trace!("Unhandled key: {:?}", key.code);
@@ -174,8 +183,17 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 
         if last_tick.elapsed() >= TICK_RATE {
             last_tick = Instant::now();
+            // Advance spinner animation if loading or if any task is running
+            if app.is_loading_plan
+                || app
+                    .tasks
+                    .iter()
+                    .any(|t| matches!(t.status, crate::task::TaskStatus::Running))
+            {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            }
         }
-        
+
         // Log every 1000 iterations to track if we're stuck (debug level, goes to file only)
         if iteration_count % 1000 == 0 {
             log::debug!("Event loop still running (iteration {})", iteration_count);
@@ -186,7 +204,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
 fn draw(frame: &mut Frame, app: &App) {
     // Calculate dynamic height for input area (up to 10 lines)
     let input_height = calculate_input_height(app, frame.size().width);
-    
+
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -208,14 +226,14 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
     let border_width = 2;
     let title_height = 1;
     let usable_width = available_width.saturating_sub(border_width);
-    
+
     if usable_width < 10 {
         return 3; // Minimum height (1 line + borders)
     }
-    
+
     // Calculate how many lines the wrapped text would take
     let mut total_lines = 0;
-    
+
     // Split by actual newlines first
     for line in app.input.lines() {
         if line.is_empty() {
@@ -224,11 +242,11 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
             // Calculate wrapping for this line
             let mut current_width = 0;
             total_lines += 1; // At least one line for this content
-            
+
             for ch in line.chars() {
                 // Approximate character width (ASCII = 1, others = 2)
                 let char_width = if ch.is_ascii() { 1 } else { 2 };
-                
+
                 if current_width + char_width > usable_width as usize {
                     total_lines += 1;
                     current_width = char_width;
@@ -238,17 +256,17 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
             }
         }
     }
-    
+
     // If input ends with newline, add one more line for cursor
     if app.input.ends_with('\n') {
         total_lines += 1;
     }
-    
+
     // If empty, we still need at least one line
     if total_lines == 0 {
         total_lines = 1;
     }
-    
+
     // Clamp between 3 (minimum: 1 line + borders) and 12 (max 10 content lines + borders + title)
     // Max content lines is 10, so max total height is 10 + 2 (borders) = 12
     let height = (total_lines + title_height).min(12).max(3);
@@ -256,12 +274,36 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    // Show spinner if loading plan
+    if app.is_loading_plan {
+        let spinner = get_spinner_char(app.spinner_frame);
+        let content = format!("{} Generating plan...", spinner);
+        let header = Paragraph::new(content)
+            .block(Block::default().borders(Borders::ALL).title("SYSAIDMIN"))
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(header, area);
+        return;
+    }
+
     // Count tasks by status
-    let complete_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Complete)).count();
-    let ready_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Ready)).count();
-    let blocked_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Blocked(_))).count();
+    let complete_count = app
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.status, crate::task::TaskStatus::Complete))
+        .count();
+    let ready_count = app
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.status, crate::task::TaskStatus::Ready))
+        .count();
+    let blocked_count = app
+        .tasks
+        .iter()
+        .filter(|t| matches!(t.status, crate::task::TaskStatus::Blocked(_)))
+        .count();
     let total_count = app.tasks.len();
-    
+
     // Build status line
     let mut status_parts = Vec::new();
     if total_count > 0 {
@@ -276,13 +318,13 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             status_parts.push(format!("⚠ {}", blocked_count));
         }
     }
-    
+
     let status_line = if !status_parts.is_empty() {
         status_parts.join(" | ")
     } else {
         "Ready for your prompt".to_string()
     };
-    
+
     // Show summary or analysis preview
     let content = if let Some(ref analysis) = app.analysis_result {
         // Show first few lines of analysis
@@ -292,7 +334,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             .clone()
             .unwrap_or_else(|| "Request a plan to get started.".into())
     };
-    
+
     let title = if app.analysis_result.is_some() {
         format!("Analysis ({})", status_line)
     } else if !app.tasks.is_empty() {
@@ -300,7 +342,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "SYSAIDMIN".to_string()
     };
-    
+
     let header = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true })
@@ -310,6 +352,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
         });
     frame.render_widget(header, area);
+}
+
+/// Get spinner character for current frame (simple rotating spinner)
+fn get_spinner_char(frame: usize) -> &'static str {
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    SPINNER[frame % SPINNER.len()]
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
@@ -325,32 +373,36 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(idx, task)| {
             let style = status_style(&task.status);
             let indicator = if idx == app.selected { "> " } else { "  " };
-            
-            // Status icon
+
+            // Status icon - show spinner for running tasks
             let status_icon = match task.status {
                 TaskStatus::Complete => "✓",
                 TaskStatus::Ready => "▶",
                 TaskStatus::Blocked(_) => "⚠",
-                TaskStatus::Running => "⟳",
+                TaskStatus::Running => {
+                    // Show animated spinner for running tasks
+                    get_spinner_char(app.spinner_frame)
+                }
                 TaskStatus::Proposed => "○",
             };
-            
+
             // For Note tasks, show details if description is just "Note"
-            let display_text = if matches!(task.detail, TaskDetail::Note { .. }) && task.description == "Note" {
-                if let TaskDetail::Note { ref details } = task.detail {
-                    // Truncate details to fit in list (max 60 chars)
-                    if details.len() > 60 {
-                        format!("{}…", &details[..60])
+            let display_text =
+                if matches!(task.detail, TaskDetail::Note { .. }) && task.description == "Note" {
+                    if let TaskDetail::Note { ref details } = task.detail {
+                        // Truncate details to fit in list (max 60 chars)
+                        if details.len() > 60 {
+                            format!("{}…", &details[..60])
+                        } else {
+                            details.clone()
+                        }
                     } else {
-                        details.clone()
+                        task.description.clone()
                     }
                 } else {
                     task.description.clone()
-                }
-            } else {
-                task.description.clone()
-            };
-            
+                };
+
             ListItem::new(Line::from(vec![
                 Span::styled(indicator, style),
                 Span::styled(status_icon, style),
@@ -371,7 +423,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     let has_analysis = app.analysis_result.is_some();
     let has_execution_results = app.execution_results.contains_key(&app.selected);
     let has_results = has_analysis || has_execution_results;
-    
+
     let constraints = if has_results {
         // Results exist: give details minimum space, results get the rest
         // Analysis gets more space than execution results
@@ -384,7 +436,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         // No results: details get all space
         [Constraint::Min(0), Constraint::Length(0)]
     };
-    
+
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -403,30 +455,36 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(detail, detail_chunks[0]);
 
     // Bottom: Results pane - prioritize analysis, then execution results
-        if has_results && detail_chunks[1].height > 2 {
-            if has_analysis {
-                // Show LLM analysis result with scrolling
-                let analysis_lines: Vec<String> = app.analysis_result.as_ref()
-                    .map(|analysis| analysis.lines().map(|s| s.to_string()).collect())
-                    .unwrap_or_else(|| vec!["No analysis available".to_string()]);
-                
-                // Calculate available height (subtract borders and title)
-                let available_height = detail_chunks[1].height.saturating_sub(2) as usize;
-                
-                // Clamp scroll offset to valid range
-                let max_scroll = analysis_lines.len().saturating_sub(available_height);
-                let scroll_offset = app.analysis_scroll_offset.min(max_scroll);
-                
-                // Get visible lines based on scroll offset
-                let visible_lines: Vec<Line> = analysis_lines
-                    .iter()
-                    .skip(scroll_offset)
-                    .take(available_height)
-                    .map(|line| Line::raw(line.clone()))
-                    .collect();
+    if has_results && detail_chunks[1].height > 2 {
+        if has_analysis {
+            // Show LLM analysis result with scrolling
+            let analysis_lines: Vec<String> = app
+                .analysis_result
+                .as_ref()
+                .map(|analysis| analysis.lines().map(|s| s.to_string()).collect())
+                .unwrap_or_else(|| vec!["No analysis available".to_string()]);
+
+            // Calculate available height (subtract borders and title)
+            let available_height = detail_chunks[1].height.saturating_sub(2) as usize;
+
+            // Clamp scroll offset to valid range
+            let max_scroll = analysis_lines.len().saturating_sub(available_height);
+            let scroll_offset = app.analysis_scroll_offset.min(max_scroll);
+
+            // Get visible lines based on scroll offset
+            let visible_lines: Vec<Line> = analysis_lines
+                .iter()
+                .skip(scroll_offset)
+                .take(available_height)
+                .map(|line| Line::raw(line.clone()))
+                .collect();
 
             let result = Paragraph::new(visible_lines)
-                .block(Block::default().borders(Borders::ALL).title("Analysis (↑↓ to scroll)"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Analysis (↑↓ to scroll)"),
+                )
                 .wrap(Wrap { trim: true })
                 .style(Style::default().fg(Color::Green));
             frame.render_widget(result, detail_chunks[1]);
@@ -449,17 +507,18 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 
 #[allow(dead_code)] // Kept for potential future use
 fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Exit Code: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{}", result.status)),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Exit Code: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("{}", result.status)),
+    ])];
 
     if !result.stdout.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("STDOUT:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "STDOUT:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Cyan),
+        )]));
         // Split stdout into lines, keeping long lines for wrapping
         for line in result.stdout.lines() {
             lines.push(Line::raw(line.to_string()));
@@ -467,9 +526,10 @@ fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
     }
 
     if !result.stderr.trim().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("STDERR:", Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "STDERR:",
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+        )]));
         // Split stderr into lines
         for line in result.stderr.lines() {
             lines.push(Line::raw(line.to_string()));
@@ -481,21 +541,19 @@ fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
 
 /// Format execution result minimally (exit code only, 1 line max)
 fn format_execution_result_minimal(result: &ExecutionResult) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("Exit: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{}", result.status)),
-            Span::raw(" | "),
-            Span::styled("Output: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(if !result.stdout.trim().is_empty() {
-                "stdout"
-            } else if !result.stderr.trim().is_empty() {
-                "stderr"
-            } else {
-                "none"
-            }),
-        ]),
-    ]
+    vec![Line::from(vec![
+        Span::styled("Exit: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("{}", result.status)),
+        Span::raw(" | "),
+        Span::styled("Output: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(if !result.stdout.trim().is_empty() {
+            "stdout"
+        } else if !result.stderr.trim().is_empty() {
+            "stderr"
+        } else {
+            "none"
+        }),
+    ])]
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -509,7 +567,10 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
                 // Truncate each line to fit available width
                 let available_width = area.width.saturating_sub(2) as usize;
                 let truncated = if line.len() > available_width {
-                    let mut truncated = line.chars().take(available_width.saturating_sub(1)).collect::<String>();
+                    let mut truncated = line
+                        .chars()
+                        .take(available_width.saturating_sub(1))
+                        .collect::<String>();
                     truncated.push('…');
                     truncated
                 } else {
@@ -518,7 +579,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
                 Line::raw(truncated)
             })
             .collect();
-        
+
         let block = Paragraph::new(message_lines)
             .style(Style::default().fg(Color::Yellow))
             .block(
@@ -535,7 +596,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         InputMode::Prompt => "Prompt (Enter=submit, Shift+Enter=newline, q=quit)",
         InputMode::Logs => "Prompt (logs focused - press Tab to edit)",
     };
-    
+
     // Use the input string directly - Paragraph will handle wrapping automatically
     // and respect explicit newlines
     let input_text = if app.input.is_empty() {
@@ -543,7 +604,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         app.input.as_str()
     };
-    
+
     let input = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Cyan))
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -554,7 +615,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
     // Calculate available width (subtract borders: 2 chars)
     let available_width = area.width.saturating_sub(2) as usize;
-    
+
     let logs: Vec<Line> = app
         .logs
         .iter()
@@ -563,7 +624,10 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
         .map(|entry| {
             // Truncate each log entry to fit available width
             let truncated = if entry.len() > available_width {
-                let mut truncated = entry.chars().take(available_width.saturating_sub(3)).collect::<String>();
+                let mut truncated = entry
+                    .chars()
+                    .take(available_width.saturating_sub(3))
+                    .collect::<String>();
                 truncated.push_str("…");
                 truncated
             } else {
@@ -572,7 +636,7 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
             Line::raw(truncated)
         })
         .collect();
-    
+
     let log_widget = Paragraph::new(logs)
         .block(Block::default().borders(Borders::ALL).title("Logs"))
         .wrap(Wrap { trim: true });

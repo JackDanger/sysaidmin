@@ -1,9 +1,9 @@
+use chrono::Local;
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use log::{Level, LevelFilter, Log, Metadata, Record};
-use chrono::Local;
 
 pub struct FileLogger {
     file: Arc<Mutex<File>>,
@@ -16,7 +16,7 @@ impl FileLogger {
             .create(true)
             .append(true)
             .open(&log_path)?;
-        
+
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             level: LevelFilter::Trace,
@@ -39,7 +39,7 @@ impl FileLogger {
             Level::Debug => "DEBUG",
             Level::Trace => "TRACE",
         };
-        
+
         let message = format!(
             "[{}] {} [{}:{}] {}\n",
             timestamp,
@@ -83,4 +83,3 @@ impl Log for FileLogger {
         }
     }
 }
-
