@@ -12,21 +12,16 @@ use crate::api::AnthropicClient;
 use crate::config::AppConfig;
 use crate::conversation::{ConversationEntry, ConversationLogger};
 use crate::executor::{ExecutionResult, Executor, FileEditOutcome};
+use crate::history::HistoryWriter;
 use crate::parser;
 use crate::session::SessionStore;
 use crate::task::{Task, TaskDetail, TaskStatus};
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum InputMode {
-    Prompt,
-    Logs,
-}
+use crate::tui::{Message, MessageType};
 
 pub struct App {
     pub tasks: Vec<Task>,
     pub selected: usize,
     pub input: String,
-    pub input_mode: InputMode,
     pub logs: Vec<String>,
     pub summary: Option<String>,
     pub execution_results: HashMap<usize, ExecutionResult>, // task index -> execution result
@@ -35,6 +30,8 @@ pub struct App {
     pub is_loading_plan: bool,   // True when waiting for plan API response
     pub spinner_frame: usize,    // Current spinner animation frame
     last_prompt: Option<String>, // Store last prompt for synthesis detection
+    messages: Vec<Message>,      // Message stream for TUI
+    message_scroll_offset: usize, // Scroll offset for message stream
     config: AppConfig,
     client: AnthropicClient,
     allowlist: Allowlist,
@@ -42,6 +39,7 @@ pub struct App {
     session: SessionStore,
     approval_queue: VecDeque<usize>,
     conversation: ConversationLogger,
+    history: HistoryWriter,
     plan_receiver: Option<Receiver<PlanResponse>>,
 }
 
@@ -79,11 +77,25 @@ impl App {
             conversation_path.display()
         );
 
+        // Initialize history writer
+        let history_path = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("sysaidmin.history.sh");
+        let history = HistoryWriter::new(history_path.clone()).unwrap_or_else(|e| {
+            warn!("Failed to create history writer: {}", e);
+            // Create a dummy writer that does nothing
+            HistoryWriter::new(PathBuf::from("/dev/null"))
+                .expect("Failed to create dummy history writer")
+        });
+        info!(
+            "History writer initialized at: {}",
+            history_path.display()
+        );
+
         Self {
             tasks: Vec::new(),
             selected: 0,
             input: String::new(),
-            input_mode: InputMode::Prompt,
             logs: Vec::new(),
             summary: None,
             execution_results: HashMap::new(),
@@ -92,6 +104,8 @@ impl App {
             is_loading_plan: false,
             spinner_frame: 0,
             last_prompt: None,
+            messages: Vec::new(),
+            message_scroll_offset: 0,
             config,
             client,
             allowlist,
@@ -99,6 +113,7 @@ impl App {
             session,
             approval_queue: VecDeque::new(),
             conversation,
+            history,
             plan_receiver: None,
         }
     }
@@ -111,6 +126,10 @@ impl App {
         }
         if self.plan_receiver.is_some() || self.is_loading_plan {
             warn!("Plan request already in progress - ignoring new prompt");
+            self.add_message(
+                "A plan is already running. Please wait for it to finish.".to_string(),
+                MessageType::Warning,
+            );
             self.log("A plan is already running. Please wait for it to finish.");
             return;
         }
@@ -122,6 +141,10 @@ impl App {
         self.is_loading_plan = true;
         self.spinner_frame = 0;
 
+        self.add_message(
+            format!("Requesting plan for: {}", prompt),
+            MessageType::Info,
+        );
         self.log(format!("Requesting plan for: {}", prompt));
 
         // Store prompt for synthesis detection
@@ -177,6 +200,10 @@ impl App {
             Ok(PlanResponse::Error(err_msg)) => {
                 self.is_loading_plan = false;
                 error!("Failed requesting plan: {}", err_msg);
+                self.add_message(
+                    format!("Failed requesting plan: {}", err_msg),
+                    MessageType::Error,
+                );
                 self.log(format!("Failed requesting plan: {}", err_msg));
             }
             Err(TryRecvError::Empty) => {
@@ -267,6 +294,13 @@ impl App {
                 trace!("Persisting plan");
                 self.persist_plan();
 
+                if let Some(ref summary) = self.summary {
+                    self.add_message(summary.clone(), MessageType::Info);
+                }
+                self.add_message(
+                    format!("Plan created with {} tasks", self.tasks.len()),
+                    MessageType::Success,
+                );
                 self.log("Plan created successfully.");
 
                 self.start_sequential_execution();
@@ -274,37 +308,15 @@ impl App {
             Err(err) => {
                 let formatted = format_error_chain(&err);
                 error!("Failed parsing plan: {}", formatted);
+                self.add_message(
+                    format!("Failed parsing plan: {}", formatted),
+                    MessageType::Error,
+                );
                 self.log(format!("Failed parsing plan: {}", formatted));
             }
         }
     }
 
-    pub fn move_next(&mut self) {
-        if self.tasks.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1).min(self.tasks.len() - 1);
-    }
-
-    pub fn move_prev(&mut self) {
-        if self.selected == 0 {
-            return;
-        }
-        self.selected -= 1;
-    }
-
-
-    pub fn scroll_analysis_up(&mut self) {
-        if self.analysis_scroll_offset > 0 {
-            self.analysis_scroll_offset -= 1;
-        }
-    }
-
-    pub fn scroll_analysis_down(&mut self) {
-        if self.analysis_result.is_some() {
-            self.analysis_scroll_offset = self.analysis_scroll_offset.saturating_add(1);
-        }
-    }
 
     fn log(&mut self, entry: impl Into<String>) {
         let line = entry.into();
@@ -315,6 +327,36 @@ impl App {
         }
         if let Err(err) = self.session.append_log(&line) {
             self.logs.push(format!("(log write failed: {err})"));
+        }
+    }
+
+    /// Add a message to the message stream (for TUI display)
+    pub fn add_message(&mut self, content: String, msg_type: MessageType) {
+        self.messages.push(Message {
+            content,
+            msg_type,
+        });
+        // Auto-scroll to bottom when new message arrives
+        self.message_scroll_offset = 0;
+    }
+
+    /// Get all messages (used by TUI for rendering)
+    pub fn get_all_messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Scroll messages up (show older messages)
+    pub fn scroll_messages_up(&mut self) {
+        let max_scroll = self.messages.len().saturating_sub(1);
+        if self.message_scroll_offset < max_scroll {
+            self.message_scroll_offset += 1;
+        }
+    }
+
+    /// Scroll messages down (show newer messages)
+    pub fn scroll_messages_down(&mut self) {
+        if self.message_scroll_offset > 0 {
+            self.message_scroll_offset -= 1;
         }
     }
 
@@ -353,6 +395,18 @@ impl App {
                     "Command details: cwd={:?}, requires_root={}",
                     cmd.cwd, cmd.requires_root
                 );
+
+                // Show command about to run
+                let full_command = if let Some(ref cwd) = cmd.cwd {
+                    format!("cd {} && {}", cwd, cmd.command)
+                } else {
+                    cmd.command.clone()
+                };
+                self.add_message(
+                    format!("Running: {}", full_command),
+                    MessageType::Command,
+                );
+
                 match self.executor.run_command(&cmd) {
                     Ok(result) => {
                         info!(
@@ -360,6 +414,14 @@ impl App {
                             result.status,
                             result.stdout.len(),
                             result.stderr.len()
+                        );
+
+                        // Write to history file
+                        let _ = self.history.append_command(
+                            &cmd.command,
+                            cmd.cwd.as_deref(),
+                            &result.stdout,
+                            &result.stderr,
                         );
 
                         // Store result for display
@@ -377,6 +439,41 @@ impl App {
                             stderr: result.stderr.clone(),
                         });
 
+                        // Show result
+                        if result.status == 0 {
+                            self.add_message(
+                                format!("✓ Command succeeded (exit {})", result.status),
+                                MessageType::Success,
+                            );
+                            if !result.stdout.trim().is_empty() {
+                                let preview = if result.stdout.len() > 200 {
+                                    format!("{}...", &result.stdout[..200])
+                                } else {
+                                    result.stdout.clone()
+                                };
+                                self.add_message(
+                                    format!("Output: {}", preview),
+                                    MessageType::Info,
+                                );
+                            }
+                        } else {
+                            self.add_message(
+                                format!("✗ Command failed (exit {})", result.status),
+                                MessageType::Error,
+                            );
+                            if !result.stderr.trim().is_empty() {
+                                let preview = if result.stderr.len() > 200 {
+                                    format!("{}...", &result.stderr[..200])
+                                } else {
+                                    result.stderr.clone()
+                                };
+                                self.add_message(
+                                    format!("Error: {}", preview),
+                                    MessageType::Error,
+                                );
+                            }
+                        }
+
                         self.mark_complete_with_log(
                             format!("Executed '{}' exit {}", description, result.status),
                             Some(result),
@@ -389,6 +486,10 @@ impl App {
                     Err(err) => {
                         let formatted = format_error_chain(&err);
                         error!("Command execution failed: {}", formatted);
+                        self.add_message(
+                            format!("✗ Execution failed: {}", formatted),
+                            MessageType::Error,
+                        );
                         self.log(format!("Execution failed: {}", formatted));
                         self.set_blocked(format!("execution failed: {}", formatted));
                     }
@@ -629,6 +730,10 @@ impl App {
 
         // Always synthesize when all tasks complete and we have results
         info!("Triggering synthesis after all tasks completed");
+        self.add_message(
+            "All tasks completed. Generating analysis...".to_string(),
+            MessageType::Info,
+        );
         self.synthesize_results();
     }
 
@@ -636,7 +741,6 @@ impl App {
     /// Synthesize execution results into an analysis
     fn synthesize_results(&mut self) {
         info!("Synthesizing execution results");
-        self.log("✓ All tasks completed. Generating analysis...");
 
         // Collect all execution results
         let mut results_summary = String::new();
@@ -683,6 +787,12 @@ impl App {
                 info!("Received synthesis result ({} chars)", analysis.len());
                 self.analysis_result = Some(analysis.clone());
                 self.analysis_scroll_offset = 0; // Reset scroll when new analysis arrives
+                
+                self.add_message(
+                    "✓ Analysis complete".to_string(),
+                    MessageType::Success,
+                );
+                self.add_message(analysis.clone(), MessageType::Recommendation);
                 self.log("✓ Analysis complete. Review in Results pane (↑/↓ to scroll).");
                 self.log("Next: Ask a follow-up question or press 'r' to run more tasks.");
 
@@ -697,77 +807,15 @@ impl App {
             Err(err) => {
                 let formatted = format_error_chain(&err);
                 error!("Synthesis failed: {}", formatted);
+                self.add_message(
+                    "All tasks completed successfully. (Synthesis unavailable)".to_string(),
+                    MessageType::Warning,
+                );
                 self.log("All tasks completed successfully. (Synthesis unavailable)");
             }
         }
     }
 
-    pub fn has_pending_approval(&self) -> bool {
-        !self.approval_queue.is_empty()
-    }
-
-    pub fn pending_approval_message(&self) -> Option<String> {
-        self.approval_queue
-            .front()
-            .and_then(|idx| self.tasks.get(*idx))
-            .and_then(|task| {
-                if let TaskStatus::Blocked(reason) = &task.status {
-                    // Truncate reason to prevent overflow (max 100 chars)
-                    let truncated_reason = if reason.len() > 100 {
-                        format!("{}…", &reason[..100])
-                    } else {
-                        reason.clone()
-                    };
-                    Some(format!(
-                        "Allow blocked task '{}'?\nReason: {}\nPress 'y' to allow, 'n' to skip.",
-                        task.description, truncated_reason
-                    ))
-                } else {
-                    None
-                }
-            })
-    }
-
-    pub fn approve_current_blocked(&mut self) {
-        if let Some(idx) = self.approval_queue.pop_front()
-            && idx < self.tasks.len() {
-                // Store selected task ID before status change
-                let selected_task_id = self.tasks.get(idx).map(|t| t.id.clone());
-                let description = self.tasks[idx].description.clone();
-
-                self.selected = idx;
-                if let Some(task) = self.tasks.get_mut(idx) {
-                    task.status = TaskStatus::Ready;
-                }
-                self.log(format!("✓ Approved: '{}' (now ready to run)", description));
-
-                // Maintain task order after status change
-                self.sort_tasks_by_status();
-
-                // Selection stays on the same task (it doesn't move)
-                if let Some(task_id) = selected_task_id
-                    && let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
-                        self.selected = new_idx;
-                    }
-
-                // Execute the newly approved task, then continue sequentially
-                self.execute_selected();
-            }
-    }
-
-    pub fn reject_current_blocked(&mut self) {
-        if let Some(idx) = self.approval_queue.pop_front() {
-            let message = self
-                .tasks
-                .get(idx)
-                .map(|task| task.description.clone())
-                .unwrap_or_else(|| "unknown task".into());
-            self.log(format!("✗ Skipped: '{}' (remains blocked)", message));
-
-            // After rejecting, continue to next task in sequence
-            self.continue_sequential_execution();
-        }
-    }
 
 
     /// Maintain tasks in original order - don't reorder by status
@@ -786,6 +834,10 @@ impl App {
             let description = self.tasks[idx].description.clone();
             match self.tasks[idx].status.clone() {
                 TaskStatus::Ready | TaskStatus::Proposed => {
+                    self.add_message(
+                        format!("Starting plan execution with: {}", description),
+                        MessageType::Info,
+                    );
                     self.log(format!("Starting plan execution with: {}", description));
                     self.execute_selected();
                 }
@@ -821,6 +873,10 @@ impl App {
             let description = self.tasks[idx].description.clone();
             match self.tasks[idx].status.clone() {
                 TaskStatus::Ready | TaskStatus::Proposed => {
+                    self.add_message(
+                        format!("Continuing with: {}", description),
+                        MessageType::Info,
+                    );
                     self.log(format!("Continuing with: {}", description));
                     self.execute_selected();
                 }
@@ -896,5 +952,103 @@ fn truncate(text: &str) -> String {
             truncated.push(ch);
         }
         format!("{}…", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::executor::Executor;
+    use crate::session::SessionStore;
+    use tempfile::TempDir;
+
+    fn create_test_app() -> App {
+        // Set a dummy API key for tests if not already set
+        if std::env::var("ANTHROPIC_API_KEY").is_err() {
+            unsafe {
+                std::env::set_var("ANTHROPIC_API_KEY", "sk-test-dummy-key-for-testing");
+            }
+        }
+        
+        // Try to load config, but use offline mode for tests
+        let mut config = AppConfig::load().unwrap_or_else(|e| {
+            panic!("Cannot create test app without config: {}. Set ANTHROPIC_API_KEY environment variable or create config file.", e);
+        });
+        config.offline_mode = true; // Force offline mode for tests
+        let client = AnthropicClient::new(&config).unwrap();
+        let allowlist = Allowlist::from_config(config.allowlist.clone()).unwrap();
+        let executor = Executor::new(false);
+        let session_dir = TempDir::new().unwrap();
+        let session = SessionStore::new(session_dir.path().to_path_buf()).unwrap();
+        App::new(config, client, allowlist, executor, session)
+    }
+
+    #[test]
+    fn add_message_appends_to_stream() {
+        let mut app = create_test_app();
+        assert_eq!(app.messages.len(), 0);
+        
+        app.add_message("Test message".to_string(), MessageType::Info);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "Test message");
+    }
+
+    #[test]
+    fn get_all_messages_returns_all() {
+        let mut app = create_test_app();
+        
+        // Add several messages
+        for i in 0..5 {
+            app.add_message(format!("Message {}", i), MessageType::Info);
+        }
+        
+        // Should get all messages
+        let all = app.get_all_messages();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn scroll_messages_up_increases_offset() {
+        let mut app = create_test_app();
+        
+        for i in 0..5 {
+            app.add_message(format!("Message {}", i), MessageType::Info);
+        }
+        
+        assert_eq!(app.message_scroll_offset, 0);
+        app.scroll_messages_up();
+        assert_eq!(app.message_scroll_offset, 1);
+    }
+
+    #[test]
+    fn scroll_messages_down_decreases_offset() {
+        let mut app = create_test_app();
+        
+        for i in 0..5 {
+            app.add_message(format!("Message {}", i), MessageType::Info);
+        }
+        
+        app.message_scroll_offset = 2;
+        app.scroll_messages_down();
+        assert_eq!(app.message_scroll_offset, 1);
+    }
+
+    #[test]
+    fn scroll_messages_down_does_not_go_below_zero() {
+        let mut app = create_test_app();
+        
+        app.message_scroll_offset = 0;
+        app.scroll_messages_down();
+        assert_eq!(app.message_scroll_offset, 0);
+    }
+
+    #[test]
+    fn new_message_resets_scroll_offset() {
+        let mut app = create_test_app();
+        
+        app.message_scroll_offset = 5;
+        app.add_message("New message".to_string(), MessageType::Info);
+        assert_eq!(app.message_scroll_offset, 0);
     }
 }

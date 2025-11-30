@@ -4,6 +4,7 @@ mod app;
 mod config;
 mod conversation;
 mod executor;
+mod history;
 mod logger;
 mod models;
 mod parser;

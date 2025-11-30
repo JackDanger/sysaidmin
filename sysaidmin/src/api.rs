@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use log::{debug, error, info, trace, warn};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
@@ -8,8 +10,16 @@ use crate::config::AppConfig;
 use crate::tokenizer;
 
 const SYS_PROMPT: &str = r#"
-You are an LLM for sysadmins to when fixing their servers. Produce structured JSON that captures a
-worklist of shell commands, configuration edits, or investigative notes.
+You are an LLM assistant for sysadmins debugging live, highly-available production servers.
+
+CRITICAL: This is for PRODUCTION debugging. Safety is paramount. Your plans should be:
+- Tight, clear, and focused on investigation and safe operations
+- Conservative: prefer read-only commands and safe diagnostics
+- Explicit: ask the user to manually run anything risky (writes, deletes, restarts, etc.)
+- Informative: provide clear recommendations and next steps
+
+All commands MUST be bash commands. No MCP or other tool invocations.
+
 Always respond with ONLY JSON following this shape:
 {
   "summary": "one line summary",
@@ -18,7 +28,7 @@ Always respond with ONLY JSON following this shape:
       "id": "task-1",
       "kind": "command" | "file_edit" | "note",
       "description": "short human description",
-      "command": "shell command (if kind=command)",
+      "command": "bash command (if kind=command)",
       "shell": "/bin/bash",
       "requires_root": true | false,
       "cwd": "/etc",
@@ -28,24 +38,30 @@ Always respond with ONLY JSON following this shape:
     }
   ]
 }
-Never include markdown code fences or commentary outside JSON.
-Keep shells POSIX compatible and focus on investigative/sysadmin workflows.
 
-IMPORTANT: Use "note" tasks sparingly - only for critical context that can't be conveyed in the summary.
-Prefer actionable "command" tasks over informational notes. If you must use notes, provide a clear, 
-descriptive "description" field (not just "Note").
+Never include markdown code fences or commentary outside JSON.
+
+For production debugging:
+- Prefer "command" tasks for safe read-only operations (checking logs, status, configs)
+- Use "note" tasks to recommend actions the user should perform manually
+- Use "file_edit" ONLY for safe, well-understood configuration changes
+- When in doubt, use a "note" task asking the user to run the command themselves
+
+All commands will be logged to sysaidmin.history.sh. The user can paste output back for analysis.
 "#;
 
 const SYNTHESIS_PROMPT: &str = r#"
-You are an LLM assistant helping sysadmins analyze server information and execution results.
-When given execution results from commands or file operations, provide a clear, concise analysis.
+You are an LLM assistant helping sysadmins analyze server information and execution results from production debugging sessions.
 
-Focus on:
-- Identifying key findings and patterns
-- Highlighting important information
-- Explaining what the results mean
-- Suggesting next steps if appropriate
+When given execution results from commands or file operations, provide a clear, concise analysis focused on:
 
+- Identifying key findings and patterns in the output
+- Highlighting important information (errors, warnings, anomalies)
+- Explaining what the results mean in the context of production debugging
+- Suggesting safe next steps for investigation
+- Recommending actions the user should perform manually (if risky)
+
+Keep your analysis focused on production debugging: be clear, actionable, and safety-conscious.
 Respond in plain text (not JSON). Be direct and informative.
 "#;
 
@@ -297,12 +313,10 @@ impl RemoteClient {
 
         info!("Sending POST request to {}", self.api_url);
         trace!("Request model: {}, max_tokens: {}", self.model, 16384);
-        let resp = self
-            .http
-            .post(&self.api_url)
-            .json(&request)
-            .send()
-            .context("failed sending request to Anthropic")?;
+        let resp = send_with_retry(
+            || self.http.post(&self.api_url).json(&request),
+            "plan request",
+        )?;
 
         let status = resp.status();
         info!("Received response: status={}", status.as_u16());
@@ -499,12 +513,10 @@ impl RemoteClient {
 
         info!("Sending synthesis POST request to {}", self.api_url);
         trace!("Request model: {}, max_tokens: {}", self.model, 2048);
-        let resp = self
-            .http
-            .post(&self.api_url)
-            .json(&request)
-            .send()
-            .context("failed to send synthesis request")?;
+        let resp = send_with_retry(
+            || self.http.post(&self.api_url).json(&request),
+            "synthesis request",
+        )?;
 
         let status = resp.status();
         let raw_body = resp
@@ -549,6 +561,60 @@ impl RemoteClient {
         );
         Ok(text)
     }
+}
+
+/// Send HTTP request with retry logic for timeouts
+/// Retries up to 3 times with exponential backoff: 1s, 2s, 4s
+fn send_with_retry<F>(build_request: F, request_type: &str) -> Result<reqwest::blocking::Response>
+where
+    F: Fn() -> RequestBuilder,
+{
+    const MAX_RETRIES: u32 = 3;
+    const INITIAL_DELAY_SECS: u64 = 1;
+
+    for attempt in 0..=MAX_RETRIES {
+        match build_request().send() {
+            Ok(resp) => {
+                if attempt > 0 {
+                    info!(
+                        "{} succeeded on retry attempt {}",
+                        request_type, attempt
+                    );
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                let is_timeout = e.is_timeout() || e.is_connect() || e.is_request();
+                
+                if is_timeout && attempt < MAX_RETRIES {
+                    let delay_secs = INITIAL_DELAY_SECS * (1 << attempt);
+                    warn!(
+                        "{} timed out (attempt {}/{}), retrying in {}s...",
+                        request_type,
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        delay_secs
+                    );
+                    std::thread::sleep(Duration::from_secs(delay_secs));
+                    continue;
+                } else {
+                    // Not a timeout, or we've exhausted retries
+                    return Err(e).context(format!(
+                        "failed sending {} to Anthropic",
+                        request_type
+                    ));
+                }
+            }
+        }
+    }
+
+    // Should never reach here, but handle it anyway
+    Err(anyhow::anyhow!(
+        "Failed to send {} after {} retries",
+        request_type,
+        MAX_RETRIES
+    ))
+    .context(format!("failed sending {} to Anthropic", request_type))
 }
 
 fn mock_plan(prompt: &str) -> String {

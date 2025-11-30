@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
 use log::{debug, info, trace};
 use ratatui::{
@@ -14,36 +14,65 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::app::{App, InputMode};
-use crate::executor::ExecutionResult;
-use crate::task::{Task, TaskDetail, TaskStatus};
+use crate::app::App;
 
-const TICK_RATE: Duration = Duration::from_millis(200);
+const TICK_RATE: Duration = Duration::from_millis(50);
+const CURSOR_BLINK_RATE: Duration = Duration::from_millis(500);
+
+/// Message types for the message stream
+#[derive(Debug, Clone)]
+pub enum MessageType {
+    Info,
+    Command,
+    Success,
+    Warning,
+    Error,
+    Recommendation,
+}
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub content: String,
+    pub msg_type: MessageType,
+}
 
 pub fn run(app: &mut App) -> Result<()> {
     info!("Initializing TUI");
+    
+    // Clear the screen before starting
+    let mut stdout = io::stdout();
+    execute!(stdout, Clear(ClearType::All)).context("Failed to clear screen")?;
+    
     trace!("Enabling raw mode");
     enable_raw_mode().context("Failed to enable raw mode")?;
-
-    trace!("Entering alternate screen");
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
 
     trace!("Creating terminal backend");
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Failed to create terminal")?;
     info!("Terminal initialized successfully");
 
+    // Add initial usage messages
+    app.add_message(
+        "Welcome to sysaidmin - Production Server Debugging Assistant".to_string(),
+        MessageType::Info,
+    );
+    app.add_message(
+        "Type your prompt below and press Enter. Use Ctrl+C or 'q' to quit.".to_string(),
+        MessageType::Info,
+    );
+    app.add_message(
+        "All commands will be logged to sysaidmin.history.sh".to_string(),
+        MessageType::Info,
+    );
+
     trace!("Starting main event loop");
     let res = run_loop(&mut terminal, app);
 
     trace!("Cleaning up TUI");
     disable_raw_mode().context("Failed to disable raw mode")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("Failed to leave alternate screen")?;
     terminal.show_cursor().context("Failed to show cursor")?;
     info!("TUI cleanup completed");
 
@@ -53,17 +82,21 @@ pub fn run(app: &mut App) -> Result<()> {
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     info!("Event loop started");
     let mut last_tick = Instant::now();
-    let mut iteration_count = 0u64;
+    let mut last_cursor_blink = Instant::now();
+    let mut cursor_visible = true;
 
     loop {
-        iteration_count += 1;
-        // Only log iterations to file, not stderr (trace level)
-
         // Check for asynchronous plan responses before drawing
         app.poll_plan_response();
 
+        // Update cursor blink
+        if last_cursor_blink.elapsed() >= CURSOR_BLINK_RATE {
+            cursor_visible = !cursor_visible;
+            last_cursor_blink = Instant::now();
+        }
+
         terminal
-            .draw(|frame| draw(frame, app))
+            .draw(|frame| draw(frame, app, cursor_visible))
             .context("Failed to draw frame")?;
 
         let timeout = TICK_RATE
@@ -73,121 +106,45 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
         if event::poll(timeout).context("Failed to poll for events")? {
             match event::read().context("Failed to read event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if app.has_pending_approval() {
-                        info!("Handling approval key");
-                        match key.code {
-                            KeyCode::Char('y') => {
-                                info!("User approved blocked task");
-                                app.approve_current_blocked();
-                                continue;
-                            }
-                            KeyCode::Char('n') => {
-                                info!("User rejected blocked task");
-                                app.reject_current_blocked();
-                                continue;
-                            }
-                            _ => {
-                                log::debug!("Ignoring key during approval: {:?}", key.code);
-                            }
-                        }
-                    }
-                    let editing = matches!(app.input_mode, InputMode::Prompt);
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        match key.code {
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if app.analysis_result.is_some() {
-                                    log::trace!("CTRL+Down/CTRL+j pressed - scrolling analysis down");
-                                    app.scroll_analysis_down();
-                                    continue;
-                                }
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if app.analysis_result.is_some() {
-                                    log::trace!("CTRL+Up/CTRL+k pressed - scrolling analysis up");
-                                    app.scroll_analysis_up();
-                                    continue;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
                     match key.code {
-                        KeyCode::Char('q') => {
+                        KeyCode::Char('q') | KeyCode::Esc => {
                             info!("Quit key pressed, exiting event loop");
                             return Ok(());
                         }
-                        KeyCode::Down | KeyCode::Char('j') if !editing => {
-                            // If analysis is displayed, scroll it instead of moving selection
-                            if app.analysis_result.is_some() {
-                                log::trace!("Scrolling analysis down");
-                                app.scroll_analysis_down();
-                            } else {
-                                log::trace!("Moving selection down");
-                                app.move_next();
+                        KeyCode::Enter => {
+                            let prompt = app.input.trim().to_string();
+                            if !prompt.is_empty() {
+                                app.submit_prompt();
                             }
                         }
-                        KeyCode::Up | KeyCode::Char('k') if !editing => {
-                            // If analysis is displayed, scroll it instead of moving selection
-                            if app.analysis_result.is_some() {
-                                log::trace!("Scrolling analysis up");
-                                app.scroll_analysis_up();
-                            } else {
-                                log::trace!("Moving selection up");
-                                app.move_prev();
-                            }
+                        KeyCode::Backspace => {
+                            app.input.pop();
                         }
-                        KeyCode::Tab => {
-                            info!("Toggling input mode");
-                            app.input_mode = match app.input_mode {
-                                InputMode::Prompt => InputMode::Logs,
-                                InputMode::Logs => InputMode::Prompt,
-                            };
-                        }
-                        KeyCode::Enter if editing => {
-                            // Shift+Enter or Ctrl+Enter adds newline, plain Enter submits
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                || key.modifiers.contains(KeyModifiers::CONTROL)
-                                || key.modifiers.contains(KeyModifiers::ALT)
-                            {
-                                log::trace!("Inserting newline (Shift/Ctrl/Alt+Enter)");
-                                app.input.push('\n');
-                            } else {
-                                // Plain Enter submits if input is not empty
-                                if !app.input.trim().is_empty() {
-                                    app.submit_prompt();
-                                } else {
-                                    log::trace!("Enter pressed but input is empty, ignoring");
-                                }
-                            }
-                        }
-                        KeyCode::Backspace if editing => {
-                            log::trace!("Backspace pressed");
-                            if !app.input.is_empty() {
-                                app.input.pop();
-                            }
-                        }
-                        KeyCode::Char(c) if editing => {
+                        KeyCode::Char(c) => {
                             app.input.push(c);
                         }
-                        // 'r' key removed - sequential execution handles task flow automatically
-                        KeyCode::Enter if !editing => {
-                            // Enter when not editing runs the selected task
-                            info!("User pressed Enter to run selected task");
-
-                            // Force redraw before execution to show spinner
-                            terminal
-                                .draw(|frame| draw(frame, app))
-                                .context("Failed to draw before execution")?;
-
-                            app.execute_selected();
-
-                            // Force redraw after execution completes
-                            terminal
-                                .draw(|frame| draw(frame, app))
-                                .context("Failed to draw after execution")?;
+                        KeyCode::Up => {
+                            // Scroll up in message history
+                            app.scroll_messages_up();
+                        }
+                        KeyCode::Down => {
+                            // Scroll down in message history
+                            app.scroll_messages_down();
+                        }
+                        KeyCode::PageUp => {
+                            // Scroll up by page
+                            for _ in 0..10 {
+                                app.scroll_messages_up();
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            // Scroll down by page
+                            for _ in 0..10 {
+                                app.scroll_messages_down();
+                            }
                         }
                         _ => {
-                            log::trace!("Unhandled key: {:?}", key.code);
+                            trace!("Unhandled key: {:?}", key.code);
                         }
                     }
                 }
@@ -195,63 +152,45 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                     debug!("Terminal resized: {}x{}", width, height);
                 }
                 other => {
-                    log::trace!("Other event: {:?}", other);
+                    trace!("Other event: {:?}", other);
                 }
             }
         }
 
         if last_tick.elapsed() >= TICK_RATE {
             last_tick = Instant::now();
-            // Advance spinner animation if loading or if any task is running
-            if app.is_loading_plan
-                || app
-                    .tasks
-                    .iter()
-                    .any(|t| matches!(t.status, crate::task::TaskStatus::Running))
-            {
-                app.spinner_frame = app.spinner_frame.wrapping_add(1);
-            }
-        }
-
-        // Log every 1000 iterations to track if we're stuck (debug level, goes to file only)
-        if iteration_count.is_multiple_of(1000) {
-            log::debug!("Event loop still running (iteration {})", iteration_count);
         }
     }
 }
 
-fn draw(frame: &mut Frame, app: &App) {
-    // Calculate dynamic height for input area (up to 10 lines)
-    let input_height = calculate_input_height(app, frame.size().width);
-
-    let main_chunks = Layout::default()
+fn draw(frame: &mut Frame, app: &App, cursor_visible: bool) {
+    // Calculate prompt height dynamically based on input content
+    let prompt_height = calculate_prompt_height(app, frame.size().width);
+    
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(input_height),
-            Constraint::Length(5),
+            Constraint::Min(1),  // Message stream (takes remaining space)
+            Constraint::Length(prompt_height), // Prompt area (dynamic)
         ])
         .split(frame.size());
 
-    draw_header(frame, main_chunks[0], app);
-    draw_body(frame, main_chunks[1], app);
-    draw_input(frame, main_chunks[2], app);
-    draw_logs(frame, main_chunks[3], app);
+    draw_message_stream(frame, chunks[0], app);
+    draw_prompt(frame, chunks[1], app, cursor_visible);
 }
 
-fn calculate_input_height(app: &App, available_width: u16) -> u16 {
-    // Account for borders (left + right = 2) and title line (1)
+fn calculate_prompt_height(app: &App, available_width: u16) -> u16 {
+    // Account for borders (left + right = 2) and prompt prefix "> "
     let border_width = 2;
-    let title_height = 1;
-    let usable_width = available_width.saturating_sub(border_width);
+    let prefix_width = 2; // "> "
+    let usable_width = available_width.saturating_sub(border_width + prefix_width);
 
     if usable_width < 10 {
-        return 3; // Minimum height (1 line + borders)
+        return 3; // Minimum height
     }
 
     // Calculate how many lines the wrapped text would take
-    let mut total_lines = 0;
+    let mut total_lines = 1; // At least one line
 
     // Split by actual newlines first
     for line in app.input.lines() {
@@ -259,14 +198,13 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
             total_lines += 1;
         } else {
             // Calculate wrapping for this line
-            let mut current_width = 0;
-            total_lines += 1; // At least one line for this content
+            let mut current_width = 0usize;
 
             for ch in line.chars() {
                 // Approximate character width (ASCII = 1, others = 2)
                 let char_width = if ch.is_ascii() { 1 } else { 2 };
 
-                if current_width + char_width > usable_width as usize {
+                if current_width + char_width > usable_width as usize && current_width > 0 {
                     total_lines += 1;
                     current_width = char_width;
                 } else {
@@ -281,428 +219,173 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
         total_lines += 1;
     }
 
-    // If empty, we still need at least one line
-    if total_lines == 0 {
-        total_lines = 1;
-    }
-
-    // Clamp between 3 (minimum: 1 line + borders) and 12 (max 10 content lines + borders + title)
-    // Max content lines is 10, so max total height is 10 + 2 (borders) = 12
-    let height = (total_lines + title_height).min(12).max(3);
+    // Add 2 for borders (top + bottom)
+    let height = (total_lines + 2).min(20).max(3); // Max 20 lines, min 3
     height as u16
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    // Show spinner if loading plan
-    if app.is_loading_plan {
-        let spinner = get_spinner_char(app.spinner_frame);
-        let content = format!("{} Generating plan...", spinner);
-        let header = Paragraph::new(content)
-            .block(Block::default().borders(Borders::ALL).title("SYSAIDMIN"))
-            .wrap(Wrap { trim: true })
-            .style(Style::default().fg(Color::Cyan));
-        frame.render_widget(header, area);
-        return;
-    }
-
-    // Count tasks by status
-    let complete_count = app
-        .tasks
-        .iter()
-        .filter(|t| matches!(t.status, crate::task::TaskStatus::Complete))
-        .count();
-    let ready_count = app
-        .tasks
-        .iter()
-        .filter(|t| matches!(t.status, crate::task::TaskStatus::Ready))
-        .count();
-    let blocked_count = app
-        .tasks
-        .iter()
-        .filter(|t| matches!(t.status, crate::task::TaskStatus::Blocked(_)))
-        .count();
-    let total_count = app.tasks.len();
-
-    // Build status line
-    let mut status_parts = Vec::new();
-    if total_count > 0 {
-        status_parts.push(format!("Total: {}", total_count));
-        if complete_count > 0 {
-            status_parts.push(format!("✓ {}", complete_count));
-        }
-        if ready_count > 0 {
-            status_parts.push(format!("▶ {}", ready_count));
-        }
-        if blocked_count > 0 {
-            status_parts.push(format!("⚠ {}", blocked_count));
+fn draw_message_stream(frame: &mut Frame, area: Rect, app: &App) {
+    // Get all messages and convert to lines with proper wrapping
+    let available_width = area.width as usize;
+    
+    let mut all_lines: Vec<Line> = Vec::new();
+    
+    // Process messages in order (oldest first)
+    for msg in app.get_all_messages().iter() {
+        let style = message_style(&msg.msg_type);
+        let prefix = message_prefix(&msg.msg_type);
+        let prefix_width = prefix.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<usize>();
+        let content_width = available_width.saturating_sub(prefix_width);
+        
+        // Split message into lines and wrap each line
+        for line in msg.content.lines() {
+            let wrapped = wrap_text(line, content_width.max(1));
+            for wrapped_line in wrapped {
+                all_lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), style),
+                    Span::styled(wrapped_line, style),
+                ]));
+            }
         }
     }
 
-    let status_line = if !status_parts.is_empty() {
-        status_parts.join(" | ")
+    // Show only the last N lines that fit in the area
+    // If we have fewer lines than the area height, pad with empty lines at the top
+    // so messages appear at the bottom (natural flow)
+    let max_lines = area.height as usize;
+    let mut visible_lines: Vec<Line> = Vec::new();
+    
+    if all_lines.len() > max_lines {
+        // Show only the most recent lines
+        let start_idx = all_lines.len() - max_lines;
+        visible_lines = all_lines.iter().skip(start_idx).cloned().collect();
     } else {
-        "Ready for your prompt".to_string()
-    };
+        // Pad with empty lines at the top so messages appear at bottom
+        let empty_lines = max_lines - all_lines.len();
+        for _ in 0..empty_lines {
+            visible_lines.push(Line::raw(""));
+        }
+        visible_lines.extend_from_slice(&all_lines);
+    }
 
-    // Show summary or analysis preview
-    let content = if let Some(ref analysis) = app.analysis_result {
-        // Show first few lines of analysis
-        analysis.lines().take(2).collect::<Vec<_>>().join("\n")
-    } else {
-        app.summary
-            .clone()
-            .unwrap_or_else(|| "Request a plan to get started.".into())
-    };
-
-    let title = if app.analysis_result.is_some() {
-        format!("Analysis ({})", status_line)
-    } else if !app.tasks.is_empty() {
-        format!("Plan ({})", status_line)
-    } else {
-        "SYSAIDMIN".to_string()
-    };
-
-    let header = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title(title))
+    let paragraph = Paragraph::new(visible_lines)
         .wrap(Wrap { trim: true })
-        .style(if app.analysis_result.is_some() {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default()
-        });
-    frame.render_widget(header, area);
+        .block(Block::default().borders(Borders::NONE));
+    frame.render_widget(paragraph, area);
 }
 
-/// Get spinner character for current frame (simple rotating spinner)
-fn get_spinner_char(frame: usize) -> &'static str {
-    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    SPINNER[frame % SPINNER.len()]
-}
-
-fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
-
-    let items: Vec<ListItem> = app
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(idx, task)| {
-            let style = status_style(&task.status);
-            let indicator = if idx == app.selected { "> " } else { "  " };
-
-            // Status icon - show spinner for running tasks
-            let status_icon = match task.status {
-                TaskStatus::Complete => "✓",
-                TaskStatus::Ready => "▶",
-                TaskStatus::Blocked(_) => "⚠",
-                TaskStatus::Running => {
-                    // Show animated spinner for running tasks
-                    get_spinner_char(app.spinner_frame)
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+    
+    for ch in text.chars() {
+        let char_width = if ch.is_ascii() { 1 } else { 2 };
+        
+            if ch == '\n' {
+                if !current_line.is_empty() {
+                    result.push(current_line.clone());
+                    current_line.clear();
                 }
-                TaskStatus::Proposed => "○",
-            };
-
-            // For Note tasks, show details if description is just "Note"
-            let display_text =
-                if matches!(task.detail, TaskDetail::Note { .. }) && task.description == "Note" {
-                    if let TaskDetail::Note { ref details } = task.detail {
-                        // Truncate details to fit in list (max 60 chars)
-                        if details.len() > 60 {
-                            format!("{}…", &details[..60])
-                        } else {
-                            details.clone()
-                        }
-                    } else {
-                        task.description.clone()
-                    }
-                } else {
-                    task.description.clone()
-                };
-
-            ListItem::new(Line::from(vec![
-                Span::styled(indicator, style),
-                Span::styled(status_icon, style),
-                Span::raw(" "),
-                Span::styled(display_text, style),
-            ]))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Plan"))
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    frame.render_widget(list, chunks[0]);
-
-    // Split Details pane into top (details) and bottom (results)
-    // Prioritize showing analysis result, then execution results
-    let has_analysis = app.analysis_result.is_some();
-    let has_execution_results = app.execution_results.contains_key(&app.selected);
-    let has_results = has_analysis || has_execution_results;
-
-    let constraints = if has_results {
-        // Results exist: give details minimum space, results get the rest
-        // Analysis gets more space than execution results
-        if has_analysis {
-            [Constraint::Min(3), Constraint::Min(10)] // More space for analysis
+                result.push(String::new());
+                current_width = 0;
+            } else if current_width + char_width > max_width && !current_line.is_empty() {
+                result.push(current_line.clone());
+                current_line.clear();
+                current_line.push(ch);
+                current_width = char_width;
         } else {
-            [Constraint::Min(5), Constraint::Min(5)] // Less space for execution results
-        }
-    } else {
-        // No results: details get all space
-        [Constraint::Min(0), Constraint::Length(0)]
-    };
-
-    let detail_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(chunks[1]);
-
-    // Top: Task details (minimal when results exist)
-    let detail_text = app
-        .tasks
-        .get(app.selected)
-        .map(task_detail_lines)
-        .unwrap_or_else(|| vec![Line::raw("No task selected")]);
-
-    let detail = Paragraph::new(detail_text)
-        .block(Block::default().borders(Borders::ALL).title("Details"))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(detail, detail_chunks[0]);
-
-    // Bottom: Results pane - prioritize analysis, then execution results
-    if has_results && detail_chunks[1].height > 2 {
-        if has_analysis {
-            // Show LLM analysis result with scrolling
-            let analysis_lines: Vec<String> = app
-                .analysis_result
-                .as_ref()
-                .map(|analysis| analysis.lines().map(|s| s.to_string()).collect())
-                .unwrap_or_else(|| vec!["No analysis available".to_string()]);
-
-            // Calculate available height (subtract borders and title)
-            let available_height = detail_chunks[1].height.saturating_sub(2) as usize;
-
-            // Clamp scroll offset to valid range
-            let max_scroll = analysis_lines.len().saturating_sub(available_height);
-            let scroll_offset = app.analysis_scroll_offset.min(max_scroll);
-
-            // Get visible lines based on scroll offset
-            let visible_lines: Vec<Line> = analysis_lines
-                .iter()
-                .skip(scroll_offset)
-                .take(available_height)
-                .map(|line| Line::raw(line.clone()))
-                .collect();
-
-            let result = Paragraph::new(visible_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Analysis (↑↓ to scroll)"),
-                )
-                .wrap(Wrap { trim: true })
-                .style(Style::default().fg(Color::Green));
-            frame.render_widget(result, detail_chunks[1]);
-        } else if has_execution_results {
-            // Show minimal execution results (exit code only, 1 line max)
-            let result_text = app
-                .execution_results
-                .get(&app.selected)
-                .map(format_execution_result_minimal)
-                .unwrap_or_else(|| vec![Line::raw("No execution results")]);
-
-            let result = Paragraph::new(result_text)
-                .block(Block::default().borders(Borders::ALL).title("Results"))
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(Color::Cyan));
-            frame.render_widget(result, detail_chunks[1]);
+            current_line.push(ch);
+            current_width += char_width;
         }
     }
+    
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+    
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    
+    result
 }
 
-
-/// Format execution result minimally (exit code only, 1 line max)
-fn format_execution_result_minimal(result: &ExecutionResult) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::styled("Exit: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!("{}", result.status)),
-        Span::raw(" | "),
-        Span::styled("Output: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(if !result.stdout.trim().is_empty() {
-            "stdout"
-        } else if !result.stderr.trim().is_empty() {
-            "stderr"
-        } else {
-            "none"
-        }),
-    ])]
-}
-
-fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    if let Some(message) = app.pending_approval_message() {
-        // Split message into lines and ensure it fits within available height
-        let available_height = area.height.saturating_sub(2) as usize; // Subtract borders
-        let message_lines: Vec<Line> = message
+fn draw_prompt(frame: &mut Frame, area: Rect, app: &App, cursor_visible: bool) {
+    // Build prompt text with cursor
+    let prompt_lines: Vec<Line> = if app.input.is_empty() {
+        vec![Line::from(vec![
+            Span::raw("> "),
+            Span::styled(if cursor_visible { "_" } else { " " }, Style::default().fg(Color::Cyan)),
+        ])]
+    } else {
+        app.input
             .lines()
-            .take(available_height)
-            .map(|line| {
-                // Truncate each line to fit available width
-                let available_width = area.width.saturating_sub(2) as usize;
-                let truncated = if line.len() > available_width {
-                    let mut truncated = line
-                        .chars()
-                        .take(available_width.saturating_sub(1))
-                        .collect::<String>();
-                    truncated.push('…');
-                    truncated
+            .enumerate()
+            .map(|(idx, line)| {
+                let is_last = idx == app.input.lines().count() - 1;
+                if is_last && cursor_visible {
+                    Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::styled("_", Style::default().fg(Color::Cyan)),
+                    ])
                 } else {
-                    line.to_string()
-                };
-                Line::raw(truncated)
+                    Line::from(vec![
+                        Span::raw("> "),
+                        Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
             })
-            .collect();
-
-        let block = Paragraph::new(message_lines)
-            .style(Style::default().fg(Color::Yellow))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Approval required (y = allow, n = skip)"),
-            )
-            .wrap(Wrap { trim: true });
-        frame.render_widget(block, area);
-        return;
-    }
-
-    let title = match app.input_mode {
-        InputMode::Prompt => "Prompt (Enter=submit, Shift+Enter=newline, q=quit)",
-        InputMode::Logs => "Prompt (logs focused - press Tab to edit)",
+            .collect()
     };
 
-    // Use the input string directly - Paragraph will handle wrapping automatically
-    // and respect explicit newlines
-    let input_text = if app.input.is_empty() {
-        " " // Show at least a space so the area is visible
-    } else {
-        app.input.as_str()
-    };
-
-    let input = Paragraph::new(input_text)
-        .style(Style::default().fg(Color::Cyan))
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(input, area);
+    let paragraph = Paragraph::new(prompt_lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::NONE));
+    frame.render_widget(paragraph, area);
 }
 
-fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
-    // Calculate available width (subtract borders: 2 chars)
-    let available_width = area.width.saturating_sub(2) as usize;
-
-    let logs: Vec<Line> = app
-        .logs
-        .iter()
-        .rev()
-        .take(4)
-        .map(|entry| {
-            // Truncate each log entry to fit available width
-            let truncated = if entry.len() > available_width {
-                let mut truncated = entry
-                    .chars()
-                    .take(available_width.saturating_sub(3))
-                    .collect::<String>();
-                truncated.push('…');
-                truncated
-            } else {
-                entry.clone()
-            };
-            Line::raw(truncated)
-        })
-        .collect();
-
-    let log_widget = Paragraph::new(logs)
-        .block(Block::default().borders(Borders::ALL).title("Logs"))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(log_widget, area);
-}
-
-fn status_style(status: &TaskStatus) -> Style {
-    match status {
-        TaskStatus::Proposed => Style::default().fg(Color::Yellow),
-        TaskStatus::Ready => Style::default().fg(Color::Green),
-        TaskStatus::Blocked(_) => Style::default().fg(Color::Red),
-        TaskStatus::Running => Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-        TaskStatus::Complete => Style::default().fg(Color::Gray),
+fn message_style(msg_type: &MessageType) -> Style {
+    match msg_type {
+        MessageType::Info => Style::default().fg(Color::White),
+        MessageType::Command => Style::default().fg(Color::Yellow),
+        MessageType::Success => Style::default().fg(Color::Green),
+        MessageType::Warning => Style::default().fg(Color::Yellow),
+        MessageType::Error => Style::default().fg(Color::Red),
+        MessageType::Recommendation => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     }
 }
 
-fn task_detail_lines(task: &Task) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Description: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(task.description.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(task.status_text()),
-        ]),
-    ];
+fn message_prefix(msg_type: &MessageType) -> String {
+    match msg_type {
+        MessageType::Info => "".to_string(),
+        MessageType::Command => "→ ".to_string(),
+        MessageType::Success => "✓ ".to_string(),
+        MessageType::Warning => "⚠ ".to_string(),
+        MessageType::Error => "✗ ".to_string(),
+        MessageType::Recommendation => "💡 ".to_string(),
+    }
+}
 
-    match &task.detail {
-        TaskDetail::Command(cmd) => {
-            lines.push(Line::from(vec![
-                Span::styled("Shell: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(cmd.shell.clone()),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Command: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(cmd.command.clone()),
-            ]));
-            if let Some(cwd) = &cmd.cwd {
-                lines.push(Line::from(vec![
-                    Span::styled("CWD: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(cwd.clone()),
-                ]));
-            }
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Requires root: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("{}", cmd.requires_root)),
-            ]));
-        }
-        TaskDetail::FileEdit(edit) => {
-            if let Some(path) = &edit.path {
-                lines.push(Line::from(vec![
-                    Span::styled("Path: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(path.clone()),
-                ]));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("Length: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("{} bytes", edit.new_text.len())),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Preview: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(edit.new_text.chars().take(120).collect::<String>()),
-            ]));
-        }
-        TaskDetail::Note { details } => {
-            lines.push(Line::from(vec![
-                Span::styled("Note: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(details.clone()),
-            ]));
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_prefix_formats_correctly() {
+        assert_eq!(message_prefix(&MessageType::Command), "→ ");
+        assert_eq!(message_prefix(&MessageType::Success), "✓ ");
+        assert_eq!(message_prefix(&MessageType::Error), "✗ ");
     }
 
-    lines
+    #[test]
+    fn message_style_returns_style() {
+        let style = message_style(&MessageType::Info);
+        assert_eq!(style.fg, Some(Color::White));
+    }
 }

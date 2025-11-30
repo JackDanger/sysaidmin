@@ -11,17 +11,6 @@ pub enum TaskStatus {
     Complete,
 }
 
-impl TaskStatus {
-    pub fn label(&self) -> &'static str {
-        match self {
-            TaskStatus::Proposed => "proposed",
-            TaskStatus::Ready => "ready",
-            TaskStatus::Blocked(_) => "blocked",
-            TaskStatus::Running => "running",
-            TaskStatus::Complete => "complete",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandTask {
@@ -68,10 +57,4 @@ impl Task {
         }
     }
 
-    pub fn status_text(&self) -> String {
-        match &self.status {
-            TaskStatus::Blocked(reason) => format!("blocked: {reason}"),
-            _ => self.status.label().to_string(),
-        }
-    }
 }
