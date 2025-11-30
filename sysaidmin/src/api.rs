@@ -49,15 +49,18 @@ Focus on:
 Respond in plain text (not JSON). Be direct and informative.
 "#;
 
+#[derive(Clone)]
 pub struct AnthropicClient {
     inner: ClientMode,
 }
 
+#[derive(Clone)]
 enum ClientMode {
     Remote(RemoteClient),
     Offline,
 }
 
+#[derive(Clone)]
 struct RemoteClient {
     http: Client,
     api_url: String,
@@ -82,10 +85,15 @@ impl AnthropicClient {
         );
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let http = Client::builder().default_headers(headers).build()
+        let http = Client::builder()
+            .default_headers(headers)
+            .build()
             .context("Failed to build HTTP client")?;
 
-        info!("AnthropicClient created: api_url={}, model={}", config.api_url, config.model);
+        info!(
+            "AnthropicClient created: api_url={}, model={}",
+            config.api_url, config.model
+        );
         Ok(Self {
             inner: ClientMode::Remote(RemoteClient {
                 http,
@@ -95,8 +103,16 @@ impl AnthropicClient {
         })
     }
 
-    pub fn plan(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
-        info!("Requesting plan from API (prompt length: {} chars, history entries: {})", prompt.len(), history.len());
+    pub fn plan(
+        &self,
+        prompt: &str,
+        history: &[crate::conversation::ConversationEntry],
+    ) -> Result<String> {
+        info!(
+            "Requesting plan from API (prompt length: {} chars, history entries: {})",
+            prompt.len(),
+            history.len()
+        );
         match &self.inner {
             ClientMode::Remote(remote) => {
                 debug!("Using remote API client");
@@ -109,8 +125,16 @@ impl AnthropicClient {
         }
     }
 
-    pub fn synthesize(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
-        info!("Requesting synthesis from API (prompt length: {} chars, history entries: {})", prompt.len(), history.len());
+    pub fn synthesize(
+        &self,
+        prompt: &str,
+        history: &[crate::conversation::ConversationEntry],
+    ) -> Result<String> {
+        info!(
+            "Requesting synthesis from API (prompt length: {} chars, history entries: {})",
+            prompt.len(),
+            history.len()
+        );
         match &self.inner {
             ClientMode::Remote(remote) => {
                 debug!("Using remote API client for synthesis");
@@ -118,41 +142,50 @@ impl AnthropicClient {
             }
             ClientMode::Offline => {
                 warn!("Using offline mock synthesis");
-                Ok(format!("Mock analysis for: {}", prompt.chars().take(100).collect::<String>()))
+                Ok(format!(
+                    "Mock analysis for: {}",
+                    prompt.chars().take(100).collect::<String>()
+                ))
             }
         }
     }
 }
 
 impl RemoteClient {
-    fn plan(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
-        trace!("Building API request with {} history entries", history.len());
-        
+    fn plan(
+        &self,
+        prompt: &str,
+        history: &[crate::conversation::ConversationEntry],
+    ) -> Result<String> {
+        trace!(
+            "Building API request with {} history entries",
+            history.len()
+        );
+
         // Truncate history to fit within token budget
         // Anthropic API typically has limits around 200k tokens for context
         // Reserve space for system prompt, current prompt, and response
         const MAX_CONTEXT_TOKENS: usize = 180_000; // Conservative limit
         let system_tokens = tokenizer::approximate_tokens(SYS_PROMPT);
         let prompt_tokens = tokenizer::approximate_tokens(prompt);
-        
-        let truncated_history = tokenizer::truncate_history(
-            history,
-            MAX_CONTEXT_TOKENS,
-            system_tokens,
-            prompt_tokens,
-        );
-        
+
+        let truncated_history =
+            tokenizer::truncate_history(history, MAX_CONTEXT_TOKENS, system_tokens, prompt_tokens);
+
         info!(
             "History: {} entries -> {} entries after truncation ({} -> {} tokens)",
             history.len(),
             truncated_history.len(),
             history.iter().map(tokenizer::entry_tokens).sum::<usize>(),
-            truncated_history.iter().map(tokenizer::entry_tokens).sum::<usize>()
+            truncated_history
+                .iter()
+                .map(tokenizer::entry_tokens)
+                .sum::<usize>()
         );
-        
+
         // Build conversation messages from truncated history
         let mut messages = Vec::new();
-        
+
         for entry in &truncated_history {
             match entry {
                 crate::conversation::ConversationEntry::Prompt { prompt: p, .. } => {
@@ -164,7 +197,12 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Plan { response, summary, task_count, .. } => {
+                crate::conversation::ConversationEntry::Plan {
+                    response,
+                    summary,
+                    task_count,
+                    ..
+                } => {
                     // Use full response if available, otherwise construct summary
                     let plan_text = if let Some(resp) = response {
                         resp.clone()
@@ -181,9 +219,19 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Command { description, command, exit_code, stdout, stderr, .. } => {
+                crate::conversation::ConversationEntry::Command {
+                    description,
+                    command,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    ..
+                } => {
                     // Include execution results as context
-                    let mut context = format!("Executed: {} (command: {})\nExit code: {}", description, command, exit_code);
+                    let mut context = format!(
+                        "Executed: {} (command: {})\nExit code: {}",
+                        description, command, exit_code
+                    );
                     if !stdout.trim().is_empty() {
                         context.push_str(&format!("\nSTDOUT:\n{}", stdout));
                     }
@@ -199,7 +247,9 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::FileEdit { description, path, .. } => {
+                crate::conversation::ConversationEntry::FileEdit {
+                    description, path, ..
+                } => {
                     let message_text = format!("[File edit completed] {}: {}", description, path);
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -209,7 +259,11 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Note { description, details, .. } => {
+                crate::conversation::ConversationEntry::Note {
+                    description,
+                    details,
+                    ..
+                } => {
                     let message_text = format!("[Note] {}: {}", description, details);
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -221,7 +275,7 @@ impl RemoteClient {
                 }
             }
         }
-        
+
         // Add current prompt
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -230,7 +284,7 @@ impl RemoteClient {
                 text: prompt.to_string(),
             }],
         });
-        
+
         // Use maximum tokens to avoid truncation - most Claude models support up to 16384
         // This ensures we get the complete response without artificial limits
         let request = MessageRequest {
@@ -252,14 +306,14 @@ impl RemoteClient {
 
         let status = resp.status();
         info!("Received response: status={}", status.as_u16());
-        
+
         trace!("Reading complete response body");
         // Read the entire response body - resp.text() reads until EOF, ensuring we get everything
         let raw_body = resp
             .text()
             .context("failed to read Anthropic response body")?;
         debug!("Response body length: {} bytes", raw_body.len());
-        
+
         // Verify we got a complete response (not empty)
         if raw_body.is_empty() {
             anyhow::bail!("Received empty response body from Anthropic API");
@@ -290,15 +344,19 @@ impl RemoteClient {
         trace!("Parsing JSON response");
         let body: MessageResponse =
             serde_json::from_str(&raw_body).context("failed to decode Anthropic response body")?;
-        
+
         // Check if response was truncated due to max_tokens
         if let Some(ref stop_reason) = body.stop_reason {
             if stop_reason == "max_tokens" {
-                warn!("Response was truncated due to max_tokens limit. Consider increasing max_tokens or reducing prompt size.");
-                anyhow::bail!("Response truncated: API stopped generating due to max_tokens limit. Increase max_tokens or reduce input size.");
+                warn!(
+                    "Response was truncated due to max_tokens limit. Consider increasing max_tokens or reducing prompt size."
+                );
+                anyhow::bail!(
+                    "Response truncated: API stopped generating due to max_tokens limit. Increase max_tokens or reduce input size."
+                );
             }
         }
-        
+
         trace!("Extracting text content from response");
         let text = body
             .content
@@ -312,22 +370,29 @@ impl RemoteClient {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        
+
         if text.is_empty() {
             error!("Response contained no text content");
             anyhow::bail!("Anthropic response did not include any text content");
         }
-        
+
         info!("Successfully extracted plan text ({} chars)", text.len());
         Ok(text)
     }
 
-    fn synthesize(&self, prompt: &str, history: &[crate::conversation::ConversationEntry]) -> Result<String> {
-        trace!("Building synthesis API request with {} history entries", history.len());
-        
+    fn synthesize(
+        &self,
+        prompt: &str,
+        history: &[crate::conversation::ConversationEntry],
+    ) -> Result<String> {
+        trace!(
+            "Building synthesis API request with {} history entries",
+            history.len()
+        );
+
         // Build conversation messages from history (same as plan)
         let mut messages = Vec::new();
-        
+
         for entry in history {
             match entry {
                 crate::conversation::ConversationEntry::Prompt { prompt: p, .. } => {
@@ -339,7 +404,12 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Plan { response, summary, task_count, .. } => {
+                crate::conversation::ConversationEntry::Plan {
+                    response,
+                    summary,
+                    task_count,
+                    ..
+                } => {
                     let plan_text = if let Some(resp) = response {
                         resp.clone()
                     } else if let Some(summary) = summary {
@@ -355,8 +425,18 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Command { description, command, exit_code, stdout, stderr, .. } => {
-                    let mut context = format!("Executed: {} (command: {})\nExit code: {}", description, command, exit_code);
+                crate::conversation::ConversationEntry::Command {
+                    description,
+                    command,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    ..
+                } => {
+                    let mut context = format!(
+                        "Executed: {} (command: {})\nExit code: {}",
+                        description, command, exit_code
+                    );
                     if !stdout.trim().is_empty() {
                         context.push_str(&format!("\nSTDOUT:\n{}", stdout));
                     }
@@ -372,7 +452,9 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::FileEdit { description, path, .. } => {
+                crate::conversation::ConversationEntry::FileEdit {
+                    description, path, ..
+                } => {
                     let message_text = format!("[File edit completed] {}: {}", description, path);
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -382,7 +464,11 @@ impl RemoteClient {
                         }],
                     });
                 }
-                crate::conversation::ConversationEntry::Note { description, details, .. } => {
+                crate::conversation::ConversationEntry::Note {
+                    description,
+                    details,
+                    ..
+                } => {
                     let message_text = format!("[Note] {}: {}", description, details);
                     messages.push(ChatMessage {
                         role: "user".to_string(),
@@ -394,7 +480,7 @@ impl RemoteClient {
                 }
             }
         }
-        
+
         // Add current synthesis prompt
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -403,7 +489,7 @@ impl RemoteClient {
                 text: prompt.to_string(),
             }],
         });
-        
+
         let request = MessageRequest {
             model: self.model.clone(),
             max_tokens: 2048, // More tokens for analysis
@@ -427,10 +513,7 @@ impl RemoteClient {
             .context("failed to read synthesis response body")?;
 
         if !status.is_success() {
-            let snippet: String = raw_body
-                .chars()
-                .take(500)
-                .collect();
+            let snippet: String = raw_body.chars().take(500).collect();
             error!("Error response snippet: {}", snippet);
             return Err(anyhow::anyhow!(
                 "Anthropic API {}: {}",
@@ -455,13 +538,16 @@ impl RemoteClient {
             })
             .unwrap_or("")
             .to_string();
-        
+
         if text.is_empty() {
             error!("Response contained no text content");
             anyhow::bail!("Anthropic response did not include any text content");
         }
-        
-        info!("Successfully extracted synthesis text ({} chars)", text.len());
+
+        info!(
+            "Successfully extracted synthesis text ({} chars)",
+            text.len()
+        );
         Ok(text)
     }
 }

@@ -1,5 +1,5 @@
 //! Hook system for intercepting and modifying behavior.
-//! 
+//!
 //! Similar to Claude Code's hook system, allowing plugins or configuration
 //! to intercept events like tool usage, prompt submission, etc.
 
@@ -71,7 +71,10 @@ impl HookManager {
 
     /// Register a hook
     pub fn register(&mut self, hook: Hook) {
-        self.hooks.entry(hook.event).or_insert_with(Vec::new).push(hook);
+        self.hooks
+            .entry(hook.event)
+            .or_insert_with(Vec::new)
+            .push(hook);
     }
 
     /// Execute hooks for an event
@@ -92,7 +95,11 @@ impl HookManager {
         results
     }
 
-    fn execute_hook(&self, hook: &Hook, input_data: &serde_json::Value) -> Result<HookResult, String> {
+    fn execute_hook(
+        &self,
+        hook: &Hook,
+        input_data: &serde_json::Value,
+    ) -> Result<HookResult, String> {
         // Serialize input data to JSON
         let input_json = serde_json::to_string(input_data)
             .map_err(|e| format!("Failed to serialize hook input: {}", e))?;
@@ -153,7 +160,7 @@ mod tests {
             command: "echo test".to_string(),
             timeout_seconds: 10,
         });
-        
+
         assert_eq!(manager.hooks.get(&HookEvent::PreToolUse).unwrap().len(), 1);
     }
 
@@ -165,4 +172,3 @@ mod tests {
         assert_eq!(results.len(), 0);
     }
 }
-

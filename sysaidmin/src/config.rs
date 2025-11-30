@@ -56,44 +56,44 @@ impl AppConfig {
         info!("Loading application configuration");
         trace!("Reading file config");
         let file_cfg = read_file_config()?;
-        
+
         trace!("Resolving API key");
         let api_key = resolve_api_key(file_cfg.anthropic_api_key.clone())?;
         debug!("API key resolved (length: {} chars)", api_key.len());
-        
+
         let api_url = file_cfg
             .anthropic_api_url
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
         info!("API URL: {}", api_url);
-        
+
         let model = file_cfg
             .anthropic_model
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         info!("Model: {}", model);
-        
+
         let default_shell = file_cfg
             .default_shell
             .unwrap_or_else(|| DEFAULT_SHELL.to_string());
         debug!("Default shell: {}", default_shell);
-        
+
         let allowlist = file_cfg.allowlist.unwrap_or_default();
         debug!("Allowlist loaded");
-        
+
         let history_limit = file_cfg.history_limit.unwrap_or(50);
         debug!("History limit: {}", history_limit);
-        
+
         let offline_mode = file_cfg.offline_mode.unwrap_or(false);
         if offline_mode {
             warn!("Offline mode enabled");
         }
-        
+
         let dry_run = resolve_bool("SYSAIDMIN_DRYRUN")
             .or_else(|| file_cfg.dry_run)
             .unwrap_or(false);
         if dry_run {
             warn!("Dry-run mode enabled");
         }
-        
+
         trace!("Resolving session directory");
         let session_root = resolve_session_dir(file_cfg.session_dir.as_deref())?;
         info!("Session root: {}", session_root.display());
@@ -120,14 +120,17 @@ fn read_file_config() -> Result<FileConfig> {
     };
 
     if !path.exists() {
-        debug!("Config file does not exist: {}, using defaults", path.display());
+        debug!(
+            "Config file does not exist: {}, using defaults",
+            path.display()
+        );
         return Ok(empty_file_config());
     }
 
     info!("Reading config file: {}", path.display());
     let data = fs::read_to_string(&path)
         .with_context(|| format!("failed reading config file {}", path.display()))?;
-    
+
     trace!("Parsing TOML config");
     toml::from_str(&data).with_context(|| {
         format!(
@@ -187,9 +190,7 @@ fn resolve_session_dir(file_override: Option<&str>) -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let base = dirs::data_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/share")));
-    Ok(base
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("sysaidmin"))
+    Ok(base.unwrap_or_else(|| PathBuf::from(".")).join("sysaidmin"))
 }
 
 fn read_dotfile_key() -> Result<Option<String>> {

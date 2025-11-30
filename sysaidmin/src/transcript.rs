@@ -1,5 +1,5 @@
 //! Transcript management for conversation history.
-//! 
+//!
 //! Maintains a JSONL transcript file similar to Claude Code's transcript format,
 //! with proper role/content structure for API compatibility.
 
@@ -39,7 +39,7 @@ impl TranscriptManager {
             .create(true)
             .append(true)
             .open(&transcript_path)?;
-        
+
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             path: transcript_path,
@@ -66,11 +66,11 @@ impl TranscriptManager {
         if !path.exists() {
             return Ok(vec![]);
         }
-        
+
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut messages = Vec::new();
-        
+
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -83,7 +83,7 @@ impl TranscriptManager {
                 }
             }
         }
-        
+
         Ok(messages)
     }
 
@@ -103,9 +103,9 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         drop(temp_file); // Close file so manager can open it
-        
+
         let manager = TranscriptManager::new(path.clone()).unwrap();
-        
+
         let message = TranscriptMessage {
             role: "user".to_string(),
             content: vec![TranscriptContentBlock {
@@ -113,9 +113,9 @@ mod tests {
                 text: "test message".to_string(),
             }],
         };
-        
+
         manager.append(message.clone()).unwrap();
-        
+
         let loaded = manager.load().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].role, "user");
@@ -127,10 +127,9 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
         drop(temp_file);
-        
+
         let manager = TranscriptManager::new(path).unwrap();
         let loaded = manager.load().unwrap();
         assert_eq!(loaded.len(), 0);
     }
 }
-

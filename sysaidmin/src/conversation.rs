@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -54,7 +54,7 @@ impl ConversationLogger {
             .create(true)
             .append(true)
             .open(&log_path)?;
-        
+
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             path: log_path,
@@ -79,11 +79,11 @@ impl ConversationLogger {
         if !path.exists() {
             return Ok(vec![]);
         }
-        
+
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
-        
+
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -97,8 +97,7 @@ impl ConversationLogger {
                 }
             }
         }
-        
+
         Ok(entries)
     }
 }
-
