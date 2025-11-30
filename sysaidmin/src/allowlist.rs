@@ -74,6 +74,8 @@ fn default_command_patterns() -> &'static [&'static str] {
         r"^(sudo\s+)?kill",
         r"^journalctl",
         r"^(sudo\s+)?systemd-analyze",
+        // Safe for-loop used for log analysis (read-only)
+        r"^for\s+\w+\s+in\s+\$\(\s*grep\s+[^)]+clippy_output\.log[^)]*\)\s*;?",
     ]
 }
 

@@ -346,8 +346,8 @@ impl RemoteClient {
             serde_json::from_str(&raw_body).context("failed to decode Anthropic response body")?;
 
         // Check if response was truncated due to max_tokens
-        if let Some(ref stop_reason) = body.stop_reason {
-            if stop_reason == "max_tokens" {
+        if let Some(ref stop_reason) = body.stop_reason
+            && stop_reason == "max_tokens" {
                 warn!(
                     "Response was truncated due to max_tokens limit. Consider increasing max_tokens or reducing prompt size."
                 );
@@ -355,7 +355,6 @@ impl RemoteClient {
                     "Response truncated: API stopped generating due to max_tokens limit. Increase max_tokens or reduce input size."
                 );
             }
-        }
 
         trace!("Extracting text content from response");
         let text = body

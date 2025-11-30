@@ -88,7 +88,7 @@ impl AppConfig {
         }
 
         let dry_run = resolve_bool("SYSAIDMIN_DRYRUN")
-            .or_else(|| file_cfg.dry_run)
+            .or(file_cfg.dry_run)
             .unwrap_or(false);
         if dry_run {
             warn!("Dry-run mode enabled");
@@ -209,13 +209,12 @@ fn read_dotfile_key() -> Result<Option<String>> {
             continue;
         }
         let parts: Vec<&str> = line.splitn(2, '=').collect();
-        if parts.len() == 2 {
-            if parts[0].trim().eq_ignore_ascii_case("ANTHROPIC_API_KEY")
-                || parts[0].trim().eq_ignore_ascii_case("api_key")
+        if parts.len() == 2
+            && (parts[0].trim().eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+                || parts[0].trim().eq_ignore_ascii_case("api_key"))
             {
                 return Ok(Some(parts[1].trim().trim_matches('"').to_string()));
             }
-        }
     }
     Ok(None)
 }

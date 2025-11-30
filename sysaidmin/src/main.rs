@@ -4,14 +4,12 @@ mod app;
 mod config;
 mod conversation;
 mod executor;
-mod hooks;
 mod logger;
 mod models;
 mod parser;
 mod session;
 mod task;
 mod tokenizer;
-mod transcript;
 mod tui;
 
 use std::env;
@@ -51,8 +49,7 @@ fn setup_panic_handler() {
             .or_else(|| {
                 panic_info
                     .payload()
-                    .downcast_ref::<String>()
-                    .map(|s| s.clone())
+                    .downcast_ref::<String>().cloned()
             })
             .unwrap_or_else(|| "unknown panic".to_string());
 

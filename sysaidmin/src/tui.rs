@@ -92,6 +92,25 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                         }
                     }
                     let editing = matches!(app.input_mode, InputMode::Prompt);
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if app.analysis_result.is_some() {
+                                    log::trace!("CTRL+Down/CTRL+j pressed - scrolling analysis down");
+                                    app.scroll_analysis_down();
+                                    continue;
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if app.analysis_result.is_some() {
+                                    log::trace!("CTRL+Up/CTRL+k pressed - scrolling analysis up");
+                                    app.scroll_analysis_up();
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     match key.code {
                         KeyCode::Char('q') => {
                             info!("Quit key pressed, exiting event loop");
@@ -195,7 +214,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
         }
 
         // Log every 1000 iterations to track if we're stuck (debug level, goes to file only)
-        if iteration_count % 1000 == 0 {
+        if iteration_count.is_multiple_of(1000) {
             log::debug!("Event loop still running (iteration {})", iteration_count);
         }
     }
@@ -505,39 +524,6 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-#[allow(dead_code)] // Kept for potential future use
-fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
-        Span::styled("Exit Code: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!("{}", result.status)),
-    ])];
-
-    if !result.stdout.trim().is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "STDOUT:",
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Cyan),
-        )]));
-        // Split stdout into lines, keeping long lines for wrapping
-        for line in result.stdout.lines() {
-            lines.push(Line::raw(line.to_string()));
-        }
-    }
-
-    if !result.stderr.trim().is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "STDERR:",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
-        )]));
-        // Split stderr into lines
-        for line in result.stderr.lines() {
-            lines.push(Line::raw(line.to_string()));
-        }
-    }
-
-    lines
-}
 
 /// Format execution result minimally (exit code only, 1 line max)
 fn format_execution_result_minimal(result: &ExecutionResult) -> Vec<Line<'static>> {
@@ -628,7 +614,7 @@ fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
                     .chars()
                     .take(available_width.saturating_sub(3))
                     .collect::<String>();
-                truncated.push_str("…");
+                truncated.push('…');
                 truncated
             } else {
                 entry.clone()

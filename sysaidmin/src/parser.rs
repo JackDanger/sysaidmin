@@ -13,7 +13,7 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
     let cleaned = strip_code_fence(raw);
     let cleaned = cleaned.trim();
     let payload =
-        extract_json_segment(&cleaned).or_else(|| extract_json_segment(&cleaned.replace('\n', "")));
+        extract_json_segment(cleaned).or_else(|| extract_json_segment(&cleaned.replace('\n', "")));
     let segment = payload.unwrap_or_else(|| cleaned.to_string());
 
     let llm_plan: LlmPlan = serde_json::from_str(segment.trim()).map_err(|err| {
@@ -87,7 +87,7 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
                 });
                 tasks.push(Task::new(description, detail));
             }
-            "note" | _ => {
+            _ => {
                 let details = entry
                     .details
                     .clone()
@@ -176,11 +176,10 @@ fn extract_json_segment(raw: &str) -> Option<String> {
             '}' => {
                 if depth > 0 {
                     depth -= 1;
-                    if depth == 0 {
-                        if let Some(start) = start_idx {
+                    if depth == 0
+                        && let Some(start) = start_idx {
                             return Some(raw[start..=idx].to_string());
                         }
-                    }
                 }
             }
             _ => {}

@@ -293,9 +293,6 @@ impl App {
         self.selected -= 1;
     }
 
-    pub fn notify(&mut self, message: impl Into<String>) {
-        self.log(message);
-    }
 
     pub fn scroll_analysis_up(&mut self) {
         if self.analysis_scroll_offset > 0 {
@@ -396,7 +393,6 @@ impl App {
                         self.set_blocked(format!("execution failed: {}", formatted));
                     }
                 }
-                return;
             }
             TaskDetail::FileEdit(edit) => {
                 let path_str = edit.path.as_deref().unwrap_or("<no path>");
@@ -448,7 +444,6 @@ impl App {
                         self.set_blocked(format!("edit failed: {}", formatted));
                     }
                 }
-                return;
             }
             TaskDetail::Note { details } => {
                 info!("Processing note task: {}", details);
@@ -494,8 +489,6 @@ impl App {
                 } else {
                     self.select_first_incomplete_or_blocked();
                 }
-
-                return;
             }
         }
     }
@@ -525,11 +518,10 @@ impl App {
 
         // Restore selection to the completed task (it stays in place, just marked complete)
         // continue_sequential_execution() will handle moving to the next task
-        if let Some(task_id) = selected_task_id {
-            if let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
+        if let Some(task_id) = selected_task_id
+            && let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
                 self.selected = new_idx;
             }
-        }
 
         self.log(summary);
         if let Some(result) = exec {
@@ -558,54 +550,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // Public API method, may be used by TUI or external code
-    pub fn dry_run(&self) -> bool {
-        self.config.dry_run
-    }
-
-    pub fn run_ready_tasks(&mut self) {
-        // Collect all ready task IDs first (before sorting changes indices)
-        let ready_task_ids: Vec<String> = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(t.status, TaskStatus::Ready))
-            .map(|t| t.id.clone())
-            .collect();
-
-        if ready_task_ids.is_empty() {
-            let blocked_count = self
-                .tasks
-                .iter()
-                .filter(|t| matches!(t.status, TaskStatus::Blocked(_)))
-                .count();
-            if blocked_count > 0 {
-                self.notify(format!(
-                    "No ready tasks. {} blocked task(s) need approval (y/n).",
-                    blocked_count
-                ));
-            } else {
-                self.notify("All tasks complete. Ask a new question or review results.");
-            }
-            return;
-        }
-
-        self.log(format!("Running {} ready task(s)...", ready_task_ids.len()));
-
-        // Execute each ready task by ID (so we find it even after sorting)
-        for task_id in ready_task_ids {
-            if let Some(idx) = self.tasks.iter().position(|t| t.id == task_id) {
-                self.selected = idx;
-                let description = self.tasks[idx].description.clone();
-                self.log(format!("▶ Executing: {}", description));
-                self.execute_selected();
-            }
-        }
-
-        // After running tasks, reset selection to first incomplete/blocked task
-        self.select_first_incomplete_or_blocked();
-        // After running tasks, check if we should synthesize
-        self.check_and_synthesize_results();
-    }
 
     /// Select the first incomplete task in order, prioritizing ready tasks over blocked
     /// For sequential execution, we want ready tasks to run first, then prompt for blocked ones
@@ -688,32 +632,6 @@ impl App {
         self.synthesize_results();
     }
 
-    /// Detect if a prompt requests analysis/synthesis
-    #[allow(dead_code)] // May be used for future fine-tuning
-    fn prompt_needs_synthesis(&self, prompt: &str) -> bool {
-        let lower = prompt.to_lowercase();
-        // Keywords that indicate analysis is needed
-        let analysis_keywords = [
-            "analyze",
-            "analysis",
-            "examine",
-            "investigate",
-            "review",
-            "what is",
-            "describe",
-            "explain",
-            "summarize",
-            "synthesis",
-            "tell me about",
-            "show me",
-            "what are",
-            "identify",
-        ];
-
-        analysis_keywords
-            .iter()
-            .any(|keyword| lower.contains(keyword))
-    }
 
     /// Synthesize execution results into an analysis
     fn synthesize_results(&mut self) {
@@ -745,7 +663,7 @@ impl App {
                     results_summary.push_str("  File edit completed\n");
                 }
 
-                results_summary.push_str("\n");
+                results_summary.push('\n');
             }
         }
 
@@ -811,8 +729,8 @@ impl App {
     }
 
     pub fn approve_current_blocked(&mut self) {
-        if let Some(idx) = self.approval_queue.pop_front() {
-            if idx < self.tasks.len() {
+        if let Some(idx) = self.approval_queue.pop_front()
+            && idx < self.tasks.len() {
                 // Store selected task ID before status change
                 let selected_task_id = self.tasks.get(idx).map(|t| t.id.clone());
                 let description = self.tasks[idx].description.clone();
@@ -827,16 +745,14 @@ impl App {
                 self.sort_tasks_by_status();
 
                 // Selection stays on the same task (it doesn't move)
-                if let Some(task_id) = selected_task_id {
-                    if let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
+                if let Some(task_id) = selected_task_id
+                    && let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
                         self.selected = new_idx;
                     }
-                }
 
                 // Execute the newly approved task, then continue sequentially
                 self.execute_selected();
             }
-        }
     }
 
     pub fn reject_current_blocked(&mut self) {
@@ -853,17 +769,6 @@ impl App {
         }
     }
 
-    fn enqueue_blocked(&mut self) {
-        self.approval_queue.clear();
-        for (idx, task) in self.tasks.iter().enumerate() {
-            if matches!(task.status, TaskStatus::Blocked(_)) {
-                self.approval_queue.push_back(idx);
-            }
-        }
-        if let Some(message) = self.pending_approval_message() {
-            self.log(message);
-        }
-    }
 
     /// Maintain tasks in original order - don't reorder by status
     /// This preserves the linear flow of the plan as tasks are completed
@@ -952,8 +857,7 @@ fn format_error_chain(err: &Error) -> String {
     for cause in err.chain() {
         let cleaned = cause
             .to_string()
-            .replace('\n', " ")
-            .replace('\r', " ")
+            .replace(['\n', '\r'], " ")
             .trim()
             .to_string();
         if !cleaned.is_empty() {

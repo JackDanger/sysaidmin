@@ -131,7 +131,7 @@ mod tests {
 
         let truncated = truncate_history(&history, 1000, 100, 50);
         assert!(truncated.len() <= 3); // Should keep all if there's space
-        assert!(truncated.len() > 0); // Should keep at least some
+        assert!(!truncated.is_empty()); // Should keep at least some
     }
 
     #[test]
