@@ -76,7 +76,6 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
             match event::read()
                 .context("Failed to read event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    debug!("Key pressed: {:?}", key.code);
                     if app.has_pending_approval() {
                         info!("Handling approval key");
                         match key.code {
@@ -102,12 +101,24 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                             return Ok(());
                         }
                         KeyCode::Down | KeyCode::Char('j') if !editing => {
-                            log::trace!("Moving selection down");
-                            app.move_next();
+                            // If analysis is displayed, scroll it instead of moving selection
+                            if app.analysis_result.is_some() {
+                                log::trace!("Scrolling analysis down");
+                                app.scroll_analysis_down();
+                            } else {
+                                log::trace!("Moving selection down");
+                                app.move_next();
+                            }
                         }
                         KeyCode::Up | KeyCode::Char('k') if !editing => {
-                            log::trace!("Moving selection up");
-                            app.move_prev();
+                            // If analysis is displayed, scroll it instead of moving selection
+                            if app.analysis_result.is_some() {
+                                log::trace!("Scrolling analysis up");
+                                app.scroll_analysis_up();
+                            } else {
+                                log::trace!("Moving selection up");
+                                app.move_prev();
+                            }
                         }
                         KeyCode::Tab => {
                             info!("Toggling input mode");
@@ -126,7 +137,6 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                             } else {
                                 // Plain Enter submits if input is not empty
                                 if !app.input.trim().is_empty() {
-                                    info!("Submitting prompt (Enter)");
                                     app.submit_prompt();
                                 } else {
                                     log::trace!("Enter pressed but input is empty, ignoring");
@@ -140,8 +150,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) ->
                             }
                         }
                         KeyCode::Char(c) if editing => {
-                            log::trace!("Character entered: {:?}", c);
                             app.input.push(c);
+                        }
+                        // 'r' key removed - sequential execution handles task flow automatically
+                        KeyCode::Enter if !editing => {
+                            // Enter when not editing runs the selected task
+                            info!("User pressed Enter to run selected task");
+                            app.execute_selected();
                         }
                         _ => {
                             log::trace!("Unhandled key: {:?}", key.code);
@@ -241,18 +256,59 @@ fn calculate_input_height(app: &App, available_width: u16) -> u16 {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let summary = app
-        .summary
-        .clone()
-        .unwrap_or_else(|| "Request a plan to get started.".into());
-    let title = if app.dry_run() {
-        "Summary [DRY-RUN]"
+    // Count tasks by status
+    let complete_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Complete)).count();
+    let ready_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Ready)).count();
+    let blocked_count = app.tasks.iter().filter(|t| matches!(t.status, crate::task::TaskStatus::Blocked(_))).count();
+    let total_count = app.tasks.len();
+    
+    // Build status line
+    let mut status_parts = Vec::new();
+    if total_count > 0 {
+        status_parts.push(format!("Total: {}", total_count));
+        if complete_count > 0 {
+            status_parts.push(format!("✓ {}", complete_count));
+        }
+        if ready_count > 0 {
+            status_parts.push(format!("▶ {}", ready_count));
+        }
+        if blocked_count > 0 {
+            status_parts.push(format!("⚠ {}", blocked_count));
+        }
+    }
+    
+    let status_line = if !status_parts.is_empty() {
+        status_parts.join(" | ")
     } else {
-        "Summary"
+        "Ready for your prompt".to_string()
     };
-    let header = Paragraph::new(summary)
+    
+    // Show summary or analysis preview
+    let content = if let Some(ref analysis) = app.analysis_result {
+        // Show first few lines of analysis
+        analysis.lines().take(2).collect::<Vec<_>>().join("\n")
+    } else {
+        app.summary
+            .clone()
+            .unwrap_or_else(|| "Request a plan to get started.".into())
+    };
+    
+    let title = if app.analysis_result.is_some() {
+        format!("Analysis ({})", status_line)
+    } else if !app.tasks.is_empty() {
+        format!("Plan ({})", status_line)
+    } else {
+        "SYSAIDMIN".to_string()
+    };
+    
+    let header = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: true });
+        .wrap(Wrap { trim: true })
+        .style(if app.analysis_result.is_some() {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        });
     frame.render_widget(header, area);
 }
 
@@ -269,11 +325,37 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(idx, task)| {
             let style = status_style(&task.status);
             let indicator = if idx == app.selected { "> " } else { "  " };
+            
+            // Status icon
+            let status_icon = match task.status {
+                TaskStatus::Complete => "✓",
+                TaskStatus::Ready => "▶",
+                TaskStatus::Blocked(_) => "⚠",
+                TaskStatus::Running => "⟳",
+                TaskStatus::Proposed => "○",
+            };
+            
+            // For Note tasks, show details if description is just "Note"
+            let display_text = if matches!(task.detail, TaskDetail::Note { .. }) && task.description == "Note" {
+                if let TaskDetail::Note { ref details } = task.detail {
+                    // Truncate details to fit in list (max 60 chars)
+                    if details.len() > 60 {
+                        format!("{}…", &details[..60])
+                    } else {
+                        details.clone()
+                    }
+                } else {
+                    task.description.clone()
+                }
+            } else {
+                task.description.clone()
+            };
+            
             ListItem::new(Line::from(vec![
                 Span::styled(indicator, style),
-                Span::styled(task.description.clone(), style),
+                Span::styled(status_icon, style),
                 Span::raw(" "),
-                Span::styled(format!("[{}]", task.status.label()), style),
+                Span::styled(display_text, style),
             ]))
         })
         .collect();
@@ -285,12 +367,19 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, chunks[0]);
 
     // Split Details pane into top (details) and bottom (results)
-    // If results exist, give them at least half the space, otherwise give details all space
-    let has_results = app.execution_results.contains_key(&app.selected);
+    // Prioritize showing analysis result, then execution results
+    let has_analysis = app.analysis_result.is_some();
+    let has_execution_results = app.execution_results.contains_key(&app.selected);
+    let has_results = has_analysis || has_execution_results;
+    
     let constraints = if has_results {
-        // Results exist: give details minimum space, results get the rest (up to half)
-        // This will push details up when results are long
-        [Constraint::Min(5), Constraint::Min(0)]
+        // Results exist: give details minimum space, results get the rest
+        // Analysis gets more space than execution results
+        if has_analysis {
+            [Constraint::Min(3), Constraint::Min(10)] // More space for analysis
+        } else {
+            [Constraint::Min(5), Constraint::Min(5)] // Less space for execution results
+        }
     } else {
         // No results: details get all space
         [Constraint::Min(0), Constraint::Length(0)]
@@ -301,7 +390,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         .constraints(constraints)
         .split(chunks[1]);
 
-    // Top: Task details
+    // Top: Task details (minimal when results exist)
     let detail_text = app
         .tasks
         .get(app.selected)
@@ -313,22 +402,52 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(detail, detail_chunks[0]);
 
-    // Bottom: Execution results (only render if results exist and we have space)
-    if has_results && detail_chunks[1].height > 2 {
-        let result_text = app
-            .execution_results
-            .get(&app.selected)
-            .map(format_execution_result)
-            .unwrap_or_else(|| vec![Line::raw("No execution results")]);
+    // Bottom: Results pane - prioritize analysis, then execution results
+        if has_results && detail_chunks[1].height > 2 {
+            if has_analysis {
+                // Show LLM analysis result with scrolling
+                let analysis_lines: Vec<String> = app.analysis_result.as_ref()
+                    .map(|analysis| analysis.lines().map(|s| s.to_string()).collect())
+                    .unwrap_or_else(|| vec!["No analysis available".to_string()]);
+                
+                // Calculate available height (subtract borders and title)
+                let available_height = detail_chunks[1].height.saturating_sub(2) as usize;
+                
+                // Clamp scroll offset to valid range
+                let max_scroll = analysis_lines.len().saturating_sub(available_height);
+                let scroll_offset = app.analysis_scroll_offset.min(max_scroll);
+                
+                // Get visible lines based on scroll offset
+                let visible_lines: Vec<Line> = analysis_lines
+                    .iter()
+                    .skip(scroll_offset)
+                    .take(available_height)
+                    .map(|line| Line::raw(line.clone()))
+                    .collect();
 
-        let result = Paragraph::new(result_text)
-            .block(Block::default().borders(Borders::ALL).title("Results"))
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Green));
-        frame.render_widget(result, detail_chunks[1]);
+            let result = Paragraph::new(visible_lines)
+                .block(Block::default().borders(Borders::ALL).title("Analysis (↑↓ to scroll)"))
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::Green));
+            frame.render_widget(result, detail_chunks[1]);
+        } else if has_execution_results {
+            // Show minimal execution results (exit code only, 1 line max)
+            let result_text = app
+                .execution_results
+                .get(&app.selected)
+                .map(format_execution_result_minimal)
+                .unwrap_or_else(|| vec![Line::raw("No execution results")]);
+
+            let result = Paragraph::new(result_text)
+                .block(Block::default().borders(Borders::ALL).title("Results"))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Cyan));
+            frame.render_widget(result, detail_chunks[1]);
+        }
     }
 }
 
+#[allow(dead_code)] // Kept for potential future use
 fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
@@ -360,15 +479,54 @@ fn format_execution_result(result: &ExecutionResult) -> Vec<Line<'static>> {
     lines
 }
 
+/// Format execution result minimally (exit code only, 1 line max)
+fn format_execution_result_minimal(result: &ExecutionResult) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Exit: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{}", result.status)),
+            Span::raw(" | "),
+            Span::styled("Output: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(if !result.stdout.trim().is_empty() {
+                "stdout"
+            } else if !result.stderr.trim().is_empty() {
+                "stderr"
+            } else {
+                "none"
+            }),
+        ]),
+    ]
+}
+
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(message) = app.pending_approval_message() {
-        let block = Paragraph::new(message)
+        // Split message into lines and ensure it fits within available height
+        let available_height = area.height.saturating_sub(2) as usize; // Subtract borders
+        let message_lines: Vec<Line> = message
+            .lines()
+            .take(available_height)
+            .map(|line| {
+                // Truncate each line to fit available width
+                let available_width = area.width.saturating_sub(2) as usize;
+                let truncated = if line.len() > available_width {
+                    let mut truncated = line.chars().take(available_width.saturating_sub(1)).collect::<String>();
+                    truncated.push('…');
+                    truncated
+                } else {
+                    line.to_string()
+                };
+                Line::raw(truncated)
+            })
+            .collect();
+        
+        let block = Paragraph::new(message_lines)
             .style(Style::default().fg(Color::Yellow))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Approval required (y = allow, n = skip)"),
-            );
+            )
+            .wrap(Wrap { trim: true });
         frame.render_widget(block, area);
         return;
     }
@@ -394,13 +552,27 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
-    let logs = app
+    // Calculate available width (subtract borders: 2 chars)
+    let available_width = area.width.saturating_sub(2) as usize;
+    
+    let logs: Vec<Line> = app
         .logs
         .iter()
         .rev()
         .take(4)
-        .map(|entry| Line::raw(entry.clone()))
-        .collect::<Vec<_>>();
+        .map(|entry| {
+            // Truncate each log entry to fit available width
+            let truncated = if entry.len() > available_width {
+                let mut truncated = entry.chars().take(available_width.saturating_sub(3)).collect::<String>();
+                truncated.push_str("…");
+                truncated
+            } else {
+                entry.clone()
+            };
+            Line::raw(truncated)
+        })
+        .collect();
+    
     let log_widget = Paragraph::new(logs)
         .block(Block::default().borders(Borders::ALL).title("Logs"))
         .wrap(Wrap { trim: true });

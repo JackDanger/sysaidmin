@@ -22,11 +22,11 @@ impl Default for AllowlistConfig {
     fn default() -> Self {
         Self {
             command_patterns: default_command_patterns()
-                .into_iter()
+                .iter()
                 .map(|s| s.to_string())
                 .collect(),
             file_patterns: default_file_patterns()
-                .into_iter()
+                .iter()
                 .map(|s| s.to_string())
                 .collect(),
             max_edit_size_kb: default_max_edit_kb(),

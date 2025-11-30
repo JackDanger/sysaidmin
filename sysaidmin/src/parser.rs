@@ -10,12 +10,19 @@ pub struct ParsedPlan {
 }
 
 pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
-    let cleaned = strip_code_fence(raw).trim();
-    let payload = extract_json_segment(cleaned)
-        .or_else(|| extract_json_segment(cleaned.replace('\n', "").as_str()));
+    let cleaned = strip_code_fence(raw);
+    let cleaned = cleaned.trim();
+    let payload = extract_json_segment(&cleaned)
+        .or_else(|| extract_json_segment(&cleaned.replace('\n', "")));
     let segment = payload.unwrap_or_else(|| cleaned.to_string());
 
     let llm_plan: LlmPlan = serde_json::from_str(segment.trim()).map_err(|err| {
+        // Check if this looks like a truncated response
+        let is_truncated = err.to_string().contains("EOF") || 
+                          segment.trim().ends_with(',') ||
+                          !segment.contains('}') ||
+                          (segment.matches('{').count() > segment.matches('}').count());
+        
         let preview = cleaned
             .lines()
             .take(6)
@@ -24,10 +31,20 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
             .chars()
             .take(500)
             .collect::<String>();
-        anyhow!(
-            "failed parsing plan JSON from SYSAIDMIN response: {err}. Snippet: {}",
-            preview
-        )
+        
+        let error_msg = if is_truncated {
+            format!(
+                "failed parsing plan JSON (response appears truncated - may need higher max_tokens): {err}. Snippet: {}",
+                preview
+            )
+        } else {
+            format!(
+                "failed parsing plan JSON from SYSAIDMIN response: {err}. Snippet: {}",
+                preview
+            )
+        };
+        
+        anyhow!(error_msg)
     })?;
 
     let mut tasks = Vec::new();
@@ -76,11 +93,23 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
                     .clone()
                     .or(entry.description.clone())
                     .unwrap_or_else(|| "Note".into());
-                let detail = TaskDetail::Note { details };
-                tasks.push(Task::new(
-                    entry.description.unwrap_or_else(|| "Note".into()),
-                    detail,
-                ));
+                let detail = TaskDetail::Note { details: details.clone() };
+                // Use details as description if description is missing or just "Note"
+                let description = entry.description
+                    .filter(|d| d != "Note" && !d.is_empty())
+                    .unwrap_or_else(|| {
+                        // Use first line of details, truncated to 60 chars
+                        details.lines().next()
+                            .map(|line| {
+                                if line.len() > 60 {
+                                    format!("{}…", &line[..60])
+                                } else {
+                                    line.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "Note".into())
+                    });
+                tasks.push(Task::new(description, detail));
             }
         }
     }
@@ -95,14 +124,37 @@ pub fn parse_plan(raw: &str, default_shell: &str) -> Result<ParsedPlan> {
     })
 }
 
-fn strip_code_fence(raw: &str) -> &str {
-    raw.trim()
-        .strip_prefix("```json")
-        .or_else(|| raw.strip_prefix("```JSON"))
-        .map(|s| s.trim_start())
-        .unwrap_or(raw.trim())
-        .strip_suffix("```")
-        .unwrap_or(raw.trim())
+fn strip_code_fence(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Handle ```json\n{...}\n``` format
+    if let Some(start) = trimmed.find("```json") {
+        let after_start = &trimmed[start + 7..]; // Skip "```json"
+        let after_start = after_start.trim_start();
+        // Find the closing ```
+        if let Some(end) = after_start.rfind("```") {
+            return after_start[..end].trim().to_string();
+        }
+        // If no closing ```, just return everything after ```json
+        return after_start.trim().to_string();
+    }
+    // Handle ```JSON (uppercase)
+    if let Some(start) = trimmed.find("```JSON") {
+        let after_start = &trimmed[start + 7..];
+        let after_start = after_start.trim_start();
+        if let Some(end) = after_start.rfind("```") {
+            return after_start[..end].trim().to_string();
+        }
+        return after_start.trim().to_string();
+    }
+    // Handle plain ``` (generic code fence)
+    if let Some(start) = trimmed.find("```") {
+        let after_start = &trimmed[start + 3..];
+        let after_start = after_start.trim_start();
+        if let Some(end) = after_start.rfind("```") {
+            return after_start[..end].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn extract_json_segment(raw: &str) -> Option<String> {
