@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
+use anyhow::Error;
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 
@@ -152,8 +153,9 @@ impl App {
             let message = match result {
                 Ok(response_text) => PlanResponse::Success(response_text),
                 Err(err) => {
-                    error!("Plan request failed in background thread: {:?}", err);
-                    PlanResponse::Error(format!("{err:?}"))
+                    let formatted = format_error_chain(&err);
+                    error!("Plan request failed in background thread: {}", formatted);
+                    PlanResponse::Error(formatted)
                 }
             };
             if tx.send(message).is_err() {
@@ -270,8 +272,9 @@ impl App {
                 self.start_sequential_execution();
             }
             Err(err) => {
-                error!("Failed parsing plan: {:?}", err);
-                self.log(format!("Failed parsing plan: {err:?}"));
+                let formatted = format_error_chain(&err);
+                error!("Failed parsing plan: {}", formatted);
+                self.log(format!("Failed parsing plan: {}", formatted));
             }
         }
     }
@@ -387,9 +390,10 @@ impl App {
                         self.continue_sequential_execution();
                     }
                     Err(err) => {
-                        error!("Command execution failed: {:?}", err);
-                        self.log(format!("Execution failed: {err:?}"));
-                        self.set_blocked(format!("execution failed: {err}"));
+                        let formatted = format_error_chain(&err);
+                        error!("Command execution failed: {}", formatted);
+                        self.log(format!("Execution failed: {}", formatted));
+                        self.set_blocked(format!("execution failed: {}", formatted));
                     }
                 }
                 return;
@@ -438,9 +442,10 @@ impl App {
                         self.continue_sequential_execution();
                     }
                     Err(err) => {
-                        error!("File edit failed: {:?}", err);
-                        self.log(format!("Edit failed: {err:?}"));
-                        self.set_blocked(format!("edit failed: {err}"));
+                        let formatted = format_error_chain(&err);
+                        error!("File edit failed: {}", formatted);
+                        self.log(format!("Edit failed: {}", formatted));
+                        self.set_blocked(format!("edit failed: {}", formatted));
                     }
                 }
                 return;
@@ -772,7 +777,8 @@ impl App {
                 });
             }
             Err(err) => {
-                error!("Synthesis failed: {:?}", err);
+                let formatted = format_error_chain(&err);
+                error!("Synthesis failed: {}", formatted);
                 self.log("All tasks completed successfully. (Synthesis unavailable)");
             }
         }
@@ -938,6 +944,37 @@ impl App {
             .enumerate()
             .find(|(_, t)| !matches!(t.status, TaskStatus::Complete))
             .map(|(idx, _)| idx)
+    }
+}
+
+fn format_error_chain(err: &Error) -> String {
+    let mut parts = Vec::new();
+    for cause in err.chain() {
+        let cleaned = cause
+            .to_string()
+            .replace('\n', " ")
+            .replace('\r', " ")
+            .trim()
+            .to_string();
+        if !cleaned.is_empty() {
+            parts.push(cleaned);
+        }
+    }
+    if parts.is_empty() {
+        "Unknown error".to_string()
+    } else {
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(idx, part)| {
+                if idx == 0 {
+                    part
+                } else {
+                    format!("caused by: {}", part)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 }
 
