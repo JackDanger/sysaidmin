@@ -1,4 +1,3 @@
-mod allowlist;
 mod api;
 mod app;
 mod config;
@@ -217,12 +216,6 @@ fn run_main() -> Result<()> {
     config.model = selected_model;
     info!("Model selected: {}", config.model);
 
-    trace!("Initializing allowlist");
-    let allowlist_cfg = config.allowlist.clone();
-    let allowlist = allowlist::Allowlist::from_config(allowlist_cfg)
-        .context("Failed to initialize allowlist")?;
-    info!("Allowlist initialized");
-
     trace!("Creating API client");
     let client = api::AnthropicClient::new(&config).context("Failed to create API client")?;
     info!("API client created (offline_mode={})", config.offline_mode);
@@ -240,7 +233,7 @@ fn run_main() -> Result<()> {
     );
 
     trace!("Creating application instance");
-    let mut app = app::App::new(config, client, allowlist, executor, session);
+    let mut app = app::App::new(config, client, executor, session);
     info!("Application instance created");
 
     trace!("Starting TUI");

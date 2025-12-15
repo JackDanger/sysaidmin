@@ -5,8 +5,6 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info, trace, warn};
 use serde::Deserialize;
 
-use crate::allowlist::AllowlistConfig;
-
 const DEFAULT_MODEL: &str = "claude-4-5-sonnet";
 const DEFAULT_SHELL: &str = "/bin/bash";
 const DEFAULT_API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -17,7 +15,6 @@ pub struct AppConfig {
     pub api_url: String,
     pub model: String,
     pub default_shell: String,
-    pub allowlist: AllowlistConfig,
     pub history_limit: usize,
     pub offline_mode: bool,
     pub dry_run: bool,
@@ -30,7 +27,6 @@ struct FileConfig {
     anthropic_api_url: Option<String>,
     anthropic_model: Option<String>,
     default_shell: Option<String>,
-    allowlist: Option<AllowlistConfig>,
     history_limit: Option<usize>,
     offline_mode: Option<bool>,
     dry_run: Option<bool>,
@@ -43,7 +39,6 @@ fn empty_file_config() -> FileConfig {
         anthropic_api_url: None,
         anthropic_model: None,
         default_shell: None,
-        allowlist: None,
         history_limit: None,
         offline_mode: None,
         dry_run: None,
@@ -76,9 +71,6 @@ impl AppConfig {
             .unwrap_or_else(|| DEFAULT_SHELL.to_string());
         debug!("Default shell: {}", default_shell);
 
-        let allowlist = file_cfg.allowlist.unwrap_or_default();
-        debug!("Allowlist loaded");
-
         let history_limit = file_cfg.history_limit.unwrap_or(50);
         debug!("History limit: {}", history_limit);
 
@@ -104,7 +96,6 @@ impl AppConfig {
             api_url,
             model,
             default_shell,
-            allowlist,
             history_limit,
             offline_mode,
             dry_run,

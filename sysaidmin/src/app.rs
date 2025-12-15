@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -7,7 +7,6 @@ use anyhow::Error;
 use chrono::Utc;
 use log::{debug, error, info, trace, warn};
 
-use crate::allowlist::Allowlist;
 use crate::api::AnthropicClient;
 use crate::config::AppConfig;
 use crate::conversation::{ConversationEntry, ConversationLogger};
@@ -32,12 +31,11 @@ pub struct App {
     last_prompt: Option<String>, // Store last prompt for synthesis detection
     messages: Vec<Message>,      // Message stream for TUI
     message_scroll_offset: usize, // Scroll offset for message stream
+    pending_command_index: Option<usize>, // Index of command awaiting user approval
     config: AppConfig,
     client: AnthropicClient,
-    allowlist: Allowlist,
     executor: Executor,
     session: SessionStore,
-    approval_queue: VecDeque<usize>,
     conversation: ConversationLogger,
     history: HistoryWriter,
     plan_receiver: Option<Receiver<PlanResponse>>,
@@ -52,7 +50,6 @@ impl App {
     pub fn new(
         config: AppConfig,
         client: AnthropicClient,
-        allowlist: Allowlist,
         executor: Executor,
         session: SessionStore,
     ) -> Self {
@@ -106,12 +103,11 @@ impl App {
             last_prompt: None,
             messages: Vec::new(),
             message_scroll_offset: 0,
+            pending_command_index: None,
             config,
             client,
-            allowlist,
             executor,
             session,
-            approval_queue: VecDeque::new(),
             conversation,
             history,
             plan_receiver: None,
@@ -241,25 +237,57 @@ impl App {
                     response: Some(response_text.clone()),
                 });
 
-                info!("Evaluating {} tasks against allowlist", self.tasks.len());
-                let mut blocked_count = 0;
+                // Display plan summary to user
+                if let Some(ref summary) = parsed.summary {
+                    self.add_message(
+                        format!("Plan: {}", summary),
+                        MessageType::Info,
+                    );
+                }
+                
+                self.add_message(
+                    format!("Plan with {} steps:", self.tasks.len()),
+                    MessageType::Info,
+                );
+
+                // All tasks start as Proposed - user must approve each one
+                // Collect task display messages first
+                let mut task_messages = Vec::new();
                 for (idx, task) in self.tasks.iter_mut().enumerate() {
-                    trace!("Evaluating task {}: {}", idx, task.description);
-                    match self.allowlist.evaluate(task) {
-                        Ok(status) => {
-                            debug!("Task {} status: {:?}", idx, status);
-                            task.status = status;
+                    task.status = TaskStatus::Proposed;
+                    let task_num = idx + 1;
+                    
+                    let mut task_msg = format!("  {}. {}", task_num, task.description);
+                    
+                    // Add task details based on type
+                    match &task.detail {
+                        TaskDetail::Command(cmd) => {
+                            let cmd_display = if let Some(ref cwd) = cmd.cwd {
+                                format!("cd {} && {}", cwd, cmd.command)
+                            } else {
+                                cmd.command.clone()
+                            };
+                            task_msg.push_str(&format!("\n     → {}", cmd_display));
                         }
-                        Err(err) => {
-                            debug!("Task {} blocked: {}", idx, err);
-                            task.status = TaskStatus::Blocked(err.to_string());
-                            blocked_count += 1;
+                        TaskDetail::FileEdit(edit) => {
+                            if let Some(ref path) = edit.path {
+                                task_msg.push_str(&format!("\n     → Edit file: {}", path));
+                            }
+                        }
+                        TaskDetail::Note { details } => {
+                            task_msg.push_str(&format!("\n     → {}", details));
                         }
                     }
+                    
+                    task_messages.push(task_msg);
                 }
-                if blocked_count > 0 {
-                    trace!("{} task(s) blocked by allowlist", blocked_count);
+                
+                // Display all task messages
+                for task_msg in task_messages {
+                    self.add_message(task_msg, MessageType::Info);
                 }
+                
+                self.add_message("".to_string(), MessageType::Info);
 
                 // Auto-complete Note tasks immediately and remove them from the list
                 let mut notes_to_remove = Vec::new();
@@ -294,16 +322,10 @@ impl App {
                 trace!("Persisting plan");
                 self.persist_plan();
 
-                if let Some(ref summary) = self.summary {
-                    self.add_message(summary.clone(), MessageType::Info);
-                }
-                self.add_message(
-                    format!("Plan created with {} tasks", self.tasks.len()),
-                    MessageType::Success,
-                );
                 self.log("Plan created successfully.");
 
-                self.start_sequential_execution();
+                // Start approval flow - show first command for approval
+                self.show_next_command_for_approval();
             }
             Err(err) => {
                 let formatted = format_error_chain(&err);
@@ -480,8 +502,8 @@ impl App {
                             None,
                         );
 
-                        // After execution, continue to next task in sequence
-                        self.continue_sequential_execution();
+                        // After execution, show next command for approval
+                        self.show_next_command_for_approval();
                     }
                     Err(err) => {
                         let formatted = format_error_chain(&err);
@@ -535,8 +557,8 @@ impl App {
                             Some(outcome),
                         );
 
-                        // After execution, continue to next task in sequence
-                        self.continue_sequential_execution();
+                        // After execution, show next command for approval
+                        self.show_next_command_for_approval();
                     }
                     Err(err) => {
                         let formatted = format_error_chain(&err);
@@ -618,7 +640,7 @@ impl App {
         self.sort_tasks_by_status();
 
         // Restore selection to the completed task (it stays in place, just marked complete)
-        // continue_sequential_execution() will handle moving to the next task
+        // show_next_command_for_approval() will handle moving to the next task
         if let Some(task_id) = selected_task_id
             && let Some(new_idx) = self.tasks.iter().position(|t| t.id == task_id) {
                 self.selected = new_idx;
@@ -827,76 +849,158 @@ impl App {
         self.tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     }
 
-    /// Start sequential execution: check first task in order and either run it or wait for approval
-    fn start_sequential_execution(&mut self) {
+    /// Show next command for user approval
+    fn show_next_command_for_approval(&mut self) {
         if let Some(idx) = self.first_pending_index() {
             self.selected = idx;
+            self.pending_command_index = Some(idx);
+            
+            // Clone task data to avoid borrow issues
+            let task_count = self.tasks.len();
+            let task_num = idx + 1;
             let description = self.tasks[idx].description.clone();
-            match self.tasks[idx].status.clone() {
-                TaskStatus::Ready | TaskStatus::Proposed => {
+            let detail = self.tasks[idx].detail.clone();
+            
+            self.add_message("".to_string(), MessageType::Info);
+            self.add_message(
+                format!("━━━ Step {}/{} ━━━", task_num, task_count),
+                MessageType::Info,
+            );
+            self.add_message(description, MessageType::Info);
+            
+            // Show the command details
+            match detail {
+                TaskDetail::Command(cmd) => {
+                    let full_command = if let Some(ref cwd) = cmd.cwd {
+                        format!("cd {} && {}", cwd, cmd.command)
+                    } else {
+                        cmd.command.clone()
+                    };
+                    self.add_message(full_command, MessageType::Command);
                     self.add_message(
-                        format!("Starting plan execution with: {}", description),
-                        MessageType::Info,
+                        "[y] run  [n] skip  or type feedback".to_string(),
+                        MessageType::Prompt,
                     );
-                    self.log(format!("Starting plan execution with: {}", description));
-                    self.execute_selected();
                 }
-                TaskStatus::Blocked(_) => {
-                    self.approval_queue.clear();
-                    self.approval_queue.push_back(idx);
-                    self.log(format!(
-                        "First task requires approval before running: {}",
-                        description
-                    ));
+                TaskDetail::FileEdit(edit) => {
+                    if let Some(ref path) = edit.path {
+                        self.add_message(
+                            format!("Edit file: {}", path),
+                            MessageType::Command,
+                        );
+                    }
+                    self.add_message(
+                        "[y] run  [n] skip  or type feedback".to_string(),
+                        MessageType::Prompt,
+                    );
                 }
-                TaskStatus::Running => {
-                    self.log(format!("Waiting for running task: {}", description));
-                }
-                TaskStatus::Complete => {
-                    // Should not happen, but fall back to continue logic
-                    self.continue_sequential_execution();
+                TaskDetail::Note { details } => {
+                    self.add_message(details, MessageType::Info);
+                    // Auto-complete notes, move to next
+                    self.pending_command_index = None;
+                    if let Some(task) = self.tasks.get_mut(idx) {
+                        task.status = TaskStatus::Complete;
+                    }
+                    self.show_next_command_for_approval();
                 }
             }
         } else {
-            self.log("All tasks complete.");
+            // No more tasks
+            self.pending_command_index = None;
+            self.add_message("".to_string(), MessageType::Info);
+            self.add_message(
+                "All steps complete.".to_string(),
+                MessageType::Success,
+            );
             self.check_and_synthesize_results();
         }
     }
 
-    /// Continue sequential execution: after a task completes, move to next and execute
-    fn continue_sequential_execution(&mut self) {
-        // Check if we should synthesize first
-        self.check_and_synthesize_results();
+    /// Check if there's a command waiting for user approval
+    pub fn has_pending_command(&self) -> bool {
+        self.pending_command_index.is_some()
+    }
 
-        if let Some(idx) = self.first_pending_index() {
-            self.selected = idx;
-            let description = self.tasks[idx].description.clone();
-            match self.tasks[idx].status.clone() {
-                TaskStatus::Ready | TaskStatus::Proposed => {
-                    self.add_message(
-                        format!("Continuing with: {}", description),
-                        MessageType::Info,
-                    );
-                    self.log(format!("Continuing with: {}", description));
-                    self.execute_selected();
-                }
-                TaskStatus::Blocked(_) => {
-                    self.approval_queue.clear();
-                    self.approval_queue.push_back(idx);
-                    self.log(format!("Next task requires approval: {}", description));
-                }
-                TaskStatus::Running => {
-                    self.log(format!("Waiting for running task: {}", description));
-                }
-                TaskStatus::Complete => {
-                    // Should not happen, but try again on next tick
-                }
+    /// User approved the pending command - execute it
+    pub fn approve_pending_command(&mut self) {
+        let Some(idx) = self.pending_command_index.take() else {
+            return;
+        };
+        
+        self.selected = idx;
+        if let Some(task) = self.tasks.get_mut(idx) {
+            task.status = TaskStatus::Ready;
+        }
+        
+        self.execute_selected();
+    }
+
+    /// User skipped the pending command - move to next
+    pub fn skip_pending_command(&mut self) {
+        let Some(idx) = self.pending_command_index.take() else {
+            return;
+        };
+        
+        self.add_message(
+            "Skipped.".to_string(),
+            MessageType::Warning,
+        );
+        
+        // Mark as complete (skipped)
+        if let Some(task) = self.tasks.get_mut(idx) {
+            task.status = TaskStatus::Complete;
+            task.annotations.push("skipped by user".to_string());
+        }
+        
+        // Log to conversation
+        if let Some(task) = self.tasks.get(idx) {
+            let _ = self.conversation.log(ConversationEntry::Note {
+                timestamp: Utc::now().to_rfc3339(),
+                task_id: task.id.clone(),
+                description: task.description.clone(),
+                details: "Skipped by user".to_string(),
+            });
+        }
+        
+        // Show next command
+        self.show_next_command_for_approval();
+    }
+
+    /// User provided feedback - send to LLM to re-plan
+    pub fn send_feedback(&mut self) {
+        let feedback = self.input.trim().to_string();
+        if feedback.is_empty() {
+            return;
+        }
+        
+        // Clear input
+        self.input.clear();
+        
+        // Get the current pending command context
+        let context = if let Some(idx) = self.pending_command_index {
+            if let Some(task) = self.tasks.get(idx) {
+                format!(
+                    "Regarding the proposed command '{}': {}",
+                    task.description, feedback
+                )
+            } else {
+                feedback.clone()
             }
         } else {
-            // No more incomplete tasks
-            self.log("All tasks complete.");
-            self.check_and_synthesize_results();
-        }
+            feedback.clone()
+        };
+        
+        // Clear pending state
+        self.pending_command_index = None;
+        
+        self.add_message(
+            format!("Feedback: {}", feedback),
+            MessageType::Info,
+        );
+        
+        // Submit as new prompt to re-plan
+        self.input = context;
+        self.submit_prompt();
     }
 
     fn first_pending_index(&self) -> Option<usize> {
@@ -977,11 +1081,10 @@ mod tests {
         });
         config.offline_mode = true; // Force offline mode for tests
         let client = AnthropicClient::new(&config).unwrap();
-        let allowlist = Allowlist::from_config(config.allowlist.clone()).unwrap();
         let executor = Executor::new(false);
         let session_dir = TempDir::new().unwrap();
         let session = SessionStore::new(session_dir.path().to_path_buf()).unwrap();
-        App::new(config, client, allowlist, executor, session)
+        App::new(config, client, executor, session)
     }
 
     #[test]
